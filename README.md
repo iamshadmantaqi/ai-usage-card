@@ -4,7 +4,7 @@ A self-updating SVG card of my AI usage over the last 30 days, shown on my [GitH
 
 ## How it works
 
-1. It reads T3 Code's local usage cache (`~/.t3/userdata/usage-scan-cache-v5.json`, plus its Cursor and rate-table caches). T3 Code already scans every tool's transcripts, so there is no parser per tool here.
+1. It reads T3 Code's local usage cache (`~/.t3/userdata/usage-scan-cache-v5.json`, plus its Cursor and rate-table caches). T3 Code already scans every tool's transcripts, so there is no parser per tool here. T3 Code saves that cache when its usage page is open, so the card is as fresh as the last visit to that page; the 30 days end on the day of the newest record.
 2. It de-duplicates records and prices them the way T3 Code does, so the card matches T3 Code's own usage view. The record layouts are documented in `ai_usage_card/load.py`.
 3. It draws `ai-usage-light.svg` and `ai-usage-dark.svg` and commits them to the `usage-card` branch of the profile repo, only when the bytes changed.
 4. A launchd job on my Mac runs this daily at 06:00. It costs no AI tokens.
@@ -15,7 +15,7 @@ The cost is what the same tokens would cost at the public API list prices (from 
 
 ## Install
 
-Needs macOS, T3 Code running now and then, the system Python 3 (`/usr/bin/python3`, standard library only) and `gh` signed in (`gh auth status`).
+Needs macOS, T3 Code's usage page opened now and then, the system Python 3 (`/usr/bin/python3`, standard library only) and `gh` signed in (`gh auth status`).
 
 ```sh
 git clone https://github.com/iamshadmantaqi/ai-usage-card.git
@@ -29,15 +29,15 @@ To try it without publishing: `python3 -m ai_usage_card --out /tmp/card` writes 
 
 ## It refuses to publish when
 
-- the cache is missing, unparsable or not version 5;
-- the newest record is older than 48 hours (T3 Code has not been running);
+- the cache is missing, unparsable or not version 5, or T3 Code has started writing a newer version beside it;
+- the newest record is older than 48 hours (T3 Code's usage cache has not been refreshed);
 - the privacy guard trips.
 
 A refusal exits non-zero, logs the reason and commits nothing.
 
 ## Privacy guard
 
-Only model names, tool names, dates and numbers reach the SVG. The renderer takes a typed `Summary` that holds nothing else, so session ids, message ids, paths, project names and chat titles never get that far. Model and tool names must also be plain names: anything with other characters, or that looks like an id, is shown as "other". Before anything is written, the output is checked for `/Users/`, `msg_`, `req_`, a UUID and `~`, and the run stops if any is found.
+Only model names, tool names, dates and numbers reach the SVG. The renderer takes a typed `Summary` that holds nothing else, so session ids, message ids, paths, project names and chat titles never get that far. Model and tool names must also be plain names: anything with other characters, or that looks like an id, is shown as "other". Before anything is written, the output is checked for `/Users/`, `/Volumes/`, `/private/`, `/home/`, `msg_`, `req_`, a UUID, a long hex id and `~`, and the run stops if any is found.
 
 ## Tests
 
