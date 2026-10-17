@@ -25,6 +25,9 @@ TOOL_LABELS = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok", "curso
                "opencode": "OpenCode", "antigravity": "Antigravity", "pi": "Pi"}
 OTHER_MODELS = "other"
 OTHER_TOOLS = "Other tools"
+# Names that mean nothing to a reader of the public card. Only the label changes: records keep
+# the source name, so pricing and exclusions still see it.
+DISPLAY_NAMES = {("cursor", "default"): "cursor-auto"}  # Cursor records its Auto model as "default"
 # Only plain model-name characters pass; anything else, or anything that looks like an id, is shown as "other".
 _SAFE_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-\[\] ]{0,63}$")
 
@@ -81,11 +84,18 @@ def _tool_label(provider: str) -> str:
     return provider.capitalize() if _safe(provider) else OTHER_TOOLS
 
 
+def _model_label(record: UsageRecord) -> str:
+    label = DISPLAY_NAMES.get((record.provider, record.model), record.model)
+    return label if _safe(label) else OTHER_MODELS
+
+
 def _top(totals: Dict[str, List[float]], limit: int, other_label: str) -> List[Slice]:
-    """The biggest `limit` rows by tokens; the rest are folded into one `other_label` row."""
-    ranked = sorted(totals.items(), key=lambda item: (-item[1][0], -item[1][1], item[0]))
+    """The biggest `limit` rows by tokens; the rest, and anything already labelled `other_label`
+    (unsafe names), are folded into one `other_label` row at the end."""
+    named = {name: v for name, v in totals.items() if name != other_label}
+    ranked = sorted(named.items(), key=lambda item: (-item[1][0], -item[1][1], item[0]))
     kept = [Slice(name, int(v[0]), v[1]) for name, v in ranked[:limit]]
-    rest = ranked[limit:]
+    rest = ranked[limit:] + ([(other_label, totals[other_label])] if other_label in totals else [])
     if rest:
         kept.append(Slice(other_label, int(sum(v[0] for _, v in rest)), sum(v[1] for _, v in rest)))
     return kept
@@ -109,7 +119,7 @@ def summarise(records: Iterable[UsageRecord], rates: Dict[str, ModelRates], toda
         daily[day][0] += tokens
         daily[day][1] += cost
         for table, label in ((by_tool, _tool_label(record.provider)),
-                             (by_model, record.model if _safe(record.model) else OTHER_MODELS)):
+                             (by_model, _model_label(record))):
             row = table.setdefault(label, [0, 0.0])
             row[0] += tokens
             row[1] += cost

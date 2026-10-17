@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 SCAN_CACHE_FILE = "usage-scan-cache-v5.json"
 CURSOR_CACHE_FILE = "usage-cursor-account-cache-v1.json"
+SETTINGS_FILE = "settings.json"
 SCAN_CACHE_VERSION = 5
 CURSOR_CACHE_VERSION = 1
 SPEEDS = ("standard", "fast", "ultrafast")
@@ -69,6 +70,25 @@ class UsageRecord:
 
 def _num(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float("inf")
+
+
+def _safe_int(value: Any) -> bool:
+    return _num(value) and float(value).is_integer() and abs(value) <= 2 ** 53 - 1
+
+
+def _valid_position(entry: Dict[str, Any]) -> bool:
+    """T3's check on a file's read position (`o` offset, `gl` guard length, `gh` guard hash)."""
+    o, gl, gh = entry.get("o"), entry.get("gl"), entry.get("gh")
+    return _safe_int(o) and o >= 0 and _safe_int(gl) and 0 <= gl <= 64 and gl <= o and _num(gh)
+
+
+def _refuse_newer_version(folder: Path, stem: str, version: int) -> None:
+    """T3 writes each cache version to its own file name and leaves the old one behind, frozen.
+    A newer file next to ours means the one we read has stopped changing."""
+    for sibling in folder.glob(stem + "*.json"):
+        suffix = sibling.name[len(stem):-len(".json")]
+        if suffix.isdigit() and int(suffix) > version:
+            raise CacheError("T3 Code now writes %s; this card reads only version %d" % (sibling.name, version))
 
 
 def _read_json(path: Path) -> Any:
@@ -114,6 +134,7 @@ def _decode_scan_rows(rows: Any, provider: str, models: List[str], sessions: Lis
 
 def load_scan_cache(path: Path, min_file_mtime_ms: float = 0) -> List[List[UsageRecord]]:
     """Records per transcript file, in cache order. Files older than `min_file_mtime_ms` are left out, as T3 does."""
+    _refuse_newer_version(path.parent, "usage-scan-cache-v", SCAN_CACHE_VERSION)
     document = _read_json(path)
     if not isinstance(document, dict) or document.get("version") != SCAN_CACHE_VERSION:
         raise CacheError("unsupported scan cache version: %r" % (document.get("version") if isinstance(document, dict) else None))
@@ -126,7 +147,7 @@ def load_scan_cache(path: Path, min_file_mtime_ms: float = 0) -> List[List[Usage
         if not isinstance(entry, dict) or not _num(entry.get("s")) or not _num(entry.get("m")):
             continue
         provider = entry.get("p")
-        if not isinstance(provider, str) or entry["m"] < min_file_mtime_ms:
+        if not isinstance(provider, str) or entry["m"] < min_file_mtime_ms or not _valid_position(entry):
             continue
         head = _decode_scan_rows(entry.get("r"), provider, models, sessions)
         tail = _decode_scan_rows(entry.get("t"), provider, models, sessions)
@@ -143,13 +164,20 @@ def cursor_rate_model(model: str) -> str:
     return "xai/" + base if base.startswith("grok-") else base
 
 
-# Cursor's own names that mean nothing to a reader of the public card. Only the displayed name
-# changes: the rate lookup still sees the original (`cursor_rate_model` runs on the raw name).
-CURSOR_DISPLAY_NAMES = {"default": "cursor-auto"}  # Cursor records its Auto model as "default"
+def cursor_usage_enabled(settings_path: Path) -> bool:
+    """T3's `cursorKeychainUsageEnabled` (default off). When off, T3 shows no Cursor account usage."""
+    if not settings_path.exists():
+        return False
+    settings = _read_json(settings_path)
+    return isinstance(settings, dict) and settings.get("cursorKeychainUsageEnabled") is True
 
 
 def load_cursor_cache(path: Path) -> List[UsageRecord]:
-    """Cursor's account usage. A missing file means no Cursor login, so no records."""
+    """Cursor's account usage. A missing file means no Cursor login, so no records.
+
+    T3 reads only the signed-in credential's cache, so when the file holds several accounts
+    (an old login left behind), only the most recently fetched one counts."""
+    _refuse_newer_version(path.parent, "usage-cursor-account-cache-v", CURSOR_CACHE_VERSION)
     if not path.exists():
         return []
     document = _read_json(path)
@@ -162,11 +190,13 @@ def load_cursor_cache(path: Path) -> List[UsageRecord]:
     def at(index: Any) -> Optional[str]:
         return strings[index] if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(strings) else None
 
-    records = []  # type: List[UsageRecord]
+    latest = None  # type: Optional[Tuple[float, List[UsageRecord]]]
     for account in accounts.values():
-        rows = account.get("records") if isinstance(account, dict) else None
-        if not isinstance(rows, list):
+        if (not isinstance(account, dict) or not isinstance(account.get("accountKey"), str)
+                or not all(_num(account.get(field)) for field in ("sinceMs", "untilMs", "fetchedAtMs"))
+                or not isinstance(account.get("records"), list)):
             continue
+        rows = account["records"]
         decoded = []  # type: List[UsageRecord]
         for row in rows:
             if not isinstance(row, list) or len(row) < 9:
@@ -176,12 +206,13 @@ def load_cursor_cache(path: Path) -> List[UsageRecord]:
             if (not _num(ts) or model is None or session is None or not all(_num(v) for v in (uncached, cached, creation, output))
                     or (cost is not None and not _num(cost)) or (key is not None and not isinstance(key, str))):
                 break
-            decoded.append(UsageRecord("cursor", int(ts), CURSOR_DISPLAY_NAMES.get(model, model), cursor_rate_model(model), session,
+            decoded.append(UsageRecord("cursor", int(ts), model, cursor_rate_model(model), session,
                                        Tokens(int(uncached), int(cached), int(creation), int(output), 0),
                                        float(cost) if cost is not None else None, "standard", key))
-        else:
-            records.extend(decoded)  # a malformed account is dropped whole, as T3 does
-    return records
+        else:  # a malformed account is dropped whole, as T3 does
+            if latest is None or account["fetchedAtMs"] > latest[0]:
+                latest = (account["fetchedAtMs"], decoded)
+    return latest[1] if latest else []
 
 
 def _shared_sessions(per_file: List[List[UsageRecord]]) -> Set[str]:
@@ -236,5 +267,6 @@ def dedupe(per_file: List[List[UsageRecord]]) -> List[UsageRecord]:
 def load_records(userdata_dir: Path, min_file_mtime_ms: float = 0) -> List[UsageRecord]:
     """Every usage record T3 Code knows about, de-duplicated. Raises CacheError if the scan cache is unusable."""
     per_file = load_scan_cache(userdata_dir / SCAN_CACHE_FILE, min_file_mtime_ms)
-    cursor = load_cursor_cache(userdata_dir / CURSOR_CACHE_FILE)
+    enabled = cursor_usage_enabled(userdata_dir / SETTINGS_FILE)
+    cursor = load_cursor_cache(userdata_dir / CURSOR_CACHE_FILE) if enabled else []
     return dedupe(per_file + [cursor])

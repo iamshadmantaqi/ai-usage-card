@@ -127,7 +127,7 @@ def price(table: Dict[str, ModelRates], record: UsageRecord) -> float:
     """Dollar cost of one record. A provider-reported cost replaces the computed one; an unpriced
     model with no reported cost counts as $0. Reasoning tokens are already inside output tokens."""
     reported = record.reported_cost_usd
-    rate = lookup_rate(table, record.rate_model or record.model)
+    rate = lookup_rate(table, record.rate_model if record.rate_model is not None else record.model)  # T3: rateModel ?? model
     if rate is None:
         return reported if reported is not None else 0.0
     r = rate.at(record.speed)
