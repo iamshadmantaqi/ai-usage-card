@@ -9,7 +9,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
-from ai_usage_card import cli
+from ai_usage_card import cli, publish
 from ai_usage_card.load import CacheError, load_records
 from ai_usage_card.pricing import load_rates, price
 from ai_usage_card.privacy import PrivacyError, check_privacy
@@ -53,6 +53,36 @@ class LoadTests(Case):
         with self.assertRaises(CacheError):
             load_records(self.userdata)
 
+    def test_cursor_usage_is_left_out_when_t3_has_it_switched_off(self):
+        fx.write_userdata(self.userdata, cursor_enabled=False)
+        self.assertEqual([r for r in load_records(self.userdata) if r.provider == "cursor"], [])
+        (self.userdata / "settings.json").unlink()  # T3's default is off
+        self.assertEqual([r for r in load_records(self.userdata) if r.provider == "cursor"], [])
+
+    def test_only_the_most_recently_fetched_cursor_account_counts(self):
+        cursor = fx.cursor_cache()
+        old = dict(cursor["accounts"]["keychain"], accountKey="old", fetchedAtMs=0,
+                   records=[[fx.ms(10, 17, 3), 0, 1, 7, 0, 0, 0, None, "cursor-account:old:1:0"]])
+        cursor["accounts"]["/old/auth.json"] = old
+        fx.write_userdata(self.userdata, cursor=cursor)
+        self.assertEqual([r.dedupe_key for r in load_records(self.userdata) if r.provider == "cursor"],
+                         ["cursor-account:k:1:0"])
+
+    def test_a_newer_cache_version_beside_ours_is_refused(self):
+        for name in ("usage-scan-cache-v6.json", "usage-cursor-account-cache-v2.json"):
+            (self.userdata / name).write_text("{}")
+            with self.assertRaises(CacheError, msg=name):
+                load_records(self.userdata)
+            (self.userdata / name).unlink()
+        (self.userdata / "usage-scan-cache-v4.json").write_text("{}")  # an older one left behind is fine
+        load_records(self.userdata)
+
+    def test_files_with_a_read_position_t3_rejects_are_skipped(self):
+        scan = fx.scan_cache()
+        scan["files"]["/f/e.jsonl"]["gl"] = 2000  # longer than the offset `o`
+        fx.write_userdata(self.userdata, scan=scan)
+        self.assertEqual([r for r in load_records(self.userdata) if r.provider == "grok"], [])
+
     def test_missing_cursor_file_means_no_cursor_records(self):
         (self.userdata / "usage-cursor-account-cache-v1.json").unlink()
         self.assertEqual([r for r in load_records(self.userdata) if r.provider == "cursor"], [])
@@ -67,10 +97,9 @@ class LoadTests(Case):
         fx.write_userdata(self.userdata, cursor=cursor, rate_table=table)
         rates = load_rates(self.userdata)
         record = next(r for r in load_records(self.userdata) if r.dedupe_key == "cursor-account:k:1:auto")
-        self.assertEqual((record.model, record.rate_model), ("cursor-auto", "default"))
+        self.assertEqual((record.model, record.rate_model), ("default", "default"))  # the record keeps the source name
         # priced through the original name: 3000 * 3e-6 + 500 * 1e-5
         self.assertAlmostEqual(price(rates, record), 0.014, places=9)
-        self.assertEqual(price(rates, record), price(rates, record.__class__(**dict(record.__dict__, model="default"))))
         labels = [m.label for m in self.summary().models]
         self.assertIn("cursor-auto", labels)
         self.assertNotIn("default", labels)
@@ -96,6 +125,11 @@ class PricingTests(Case):
         record = next(r for r in load_records(self.userdata) if r.model == "claude-sonnet-5-5")
         for name in ("Claude-Sonnet-5-5[1m]", "CLAUDE-SONNET-5-5"):
             self.assertAlmostEqual(price(rates, record.__class__(**dict(record.__dict__, model=name))), 0.007, places=9)
+
+    def test_an_empty_rate_model_is_unpriced_not_priced_by_model(self):
+        rates = load_rates(self.userdata)
+        record = next(r for r in load_records(self.userdata) if r.model == "claude-sonnet-5-5")
+        self.assertEqual(price(rates, record.__class__(**dict(record.__dict__, rate_model=""))), 0.0)
 
     def test_bare_family_names_are_never_priced(self):
         rates = load_rates(self.userdata)
@@ -133,6 +167,16 @@ class SummaryTests(Case):
         opus = next(m for m in self.summary().models if m.label == "claude-opus-5-5")
         self.assertAlmostEqual(opus.cost_usd, 0.02495 + 0.0022 + 0.5, places=6)
 
+    def test_unsafe_names_and_the_tail_share_one_other_row(self):
+        scan = fx.scan_cache()
+        scan["models"] = scan["models"][:]
+        scan["models"][4] = "stealth/ox-alpha"  # mystery-model, 2000 tokens, now unsafe
+        fx.write_userdata(self.userdata, scan=scan)
+        models = [(m.label, m.tokens) for m in self.summary().models]
+        self.assertEqual(models, [("claude-sonnet-5-5", 11000), ("claude-opus-5-5", 10320),
+                                  ("cursor-grok-4.6-high-fast", 3500), ("gpt-6-luna", 350),
+                                  ("tiny-3", 3), ("tiny-2", 2), ("other", 2001)])
+
     def test_odd_model_names_are_shown_as_other(self):
         scan = fx.scan_cache()
         scan["models"] = scan["models"][:]
@@ -163,10 +207,11 @@ class RenderTests(Case):
     def test_number_formats(self):
         self.assertEqual([fmt_tokens(n) for n in (0, 999, 1234, 12345678, 123456789, 999960, 1_234_567_890)],
                          ["0", "999", "1.2K", "12.3M", "123M", "1.0M", "1.2B"])
-        self.assertEqual([fmt_cost(c) for c in (0, 0.0123, 99.99, 1234.5)], ["$0", "$0.01", "$99.99", "$1,234"])
+        self.assertEqual([fmt_cost(c) for c in (0, 0.0123, 99.99, 99.996, 1234.5)], ["$0", "$0.01", "$99.99", "$100", "$1,234"])
 
     def test_privacy_guard_refuses_paths_and_ids(self):
-        for bad in ("/Users/me/x", "msg_01ABC", "req_01ABC", "123e4567-e89b-12d3-a456-426614174000", "~/notes"):
+        for bad in ("/Users/me/x", "msg_01ABC", "req_01ABC", "123e4567-e89b-12d3-a456-426614174000", "~/notes",
+                    "/Volumes/Work/x", "/private/var/x", "/home/me/x", "3f2a9c41d07e4b8a9f1e6c2d5b7a0e93"):
             with self.assertRaises(PrivacyError, msg=bad):
                 check_privacy("<svg>%s</svg>" % bad)
         check_privacy(render(self.summary(), DARK))
@@ -194,7 +239,28 @@ class CliTests(Case):
         out = self.tmp / "out"
         self.assertEqual(self.run_cli("--out", str(out), now=fx.NOW + timedelta(hours=49)), 1)
         self.assertFalse(out.exists())
-        self.assertIn("T3 Code is not running", (self.tmp / "card.log").read_text())
+        self.assertIn("usage cache has not been refreshed", (self.tmp / "card.log").read_text())
+
+    def test_the_window_ends_on_the_newest_record_day_not_today(self):
+        out = self.tmp / "out"
+        # 40 hours later it is 19 Oct, but the newest record is from 18 Oct: 19 Oct was never loaded.
+        self.assertEqual(self.run_cli("--out", str(out), now=fx.NOW + timedelta(hours=40)), 0)
+        svg = (out / "ai-usage-dark.svg").read_text()
+        self.assertIn("updated 18 Oct 2026", svg)
+        self.assertIn(">18 Oct<", svg)
+        self.assertNotIn("19 Oct", svg)
+
+    def test_future_and_out_of_range_timestamps_are_ignored(self):
+        scan = fx.scan_cache()
+        scan["files"]["/f/z.jsonl"] = fx.entry("claude", [
+            fx.row(10 ** 15, "claude-sonnet-5-5", 0, 1, 0, 0, 0, "msg_huge:req_huge"),
+            fx.row(fx.ms(10, 25, 1), "claude-sonnet-5-5", 0, 1, 0, 0, 0, "msg_future:req_future")])
+        fx.write_userdata(self.userdata, scan=scan)
+        out = self.tmp / "out"
+        self.assertEqual(self.run_cli("--out", str(out)), 0)
+        self.assertIn("updated 18 Oct 2026", (out / "ai-usage-dark.svg").read_text())
+        # with only a future record, the age check still refuses
+        self.assertEqual(self.run_cli("--out", str(out), now=fx.NOW + timedelta(hours=49)), 1)
 
     def test_refuses_when_the_privacy_guard_trips(self):
         out = self.tmp / "out"
@@ -233,6 +299,33 @@ class CliTests(Case):
             fx.write_userdata(self.userdata, scan=scan)
             self.assertEqual(self.run_cli(*publish_args), 0)
             self.assertEqual(git("rev-list", "--count", "usage-card"), "2")
+
+    def test_a_commit_whose_push_failed_is_pushed_on_the_next_run(self):
+        remote = self.tmp / "remote.git"
+        subprocess.run(["/usr/bin/git", "init", "-q", "--bare", str(remote)], check=True)
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+        publish_args = ["--repo", str(remote), "--clone", str(self.tmp / "clone"), "--git-credential-helper", ""]
+        real_git = publish._git
+
+        def push_fails(clone, *args, **kwargs):
+            if args[0] == "push":
+                raise publish.PublishError("git push failed: network")
+            return real_git(clone, *args, **kwargs)
+
+        def remote_branch():
+            return subprocess.run(["/usr/bin/git", "--git-dir", str(remote), "branch", "--list", "usage-card"],
+                                  stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
+
+        with mock.patch.dict(os.environ, env):
+            with mock.patch.object(publish, "_git", side_effect=push_fails):
+                self.assertEqual(self.run_cli(*publish_args), 1)
+            self.assertEqual(remote_branch(), "")
+            self.assertEqual(self.run_cli(*publish_args), 0)  # same bytes, but the commit was never pushed
+            self.assertEqual(remote_branch(), "usage-card")
+            # and when the remote branch is deleted, the next run puts it back
+            subprocess.run(["/usr/bin/git", "--git-dir", str(remote), "branch", "-q", "-D", "usage-card"], check=True)
+            self.assertEqual(self.run_cli(*publish_args), 0)
+            self.assertEqual(remote_branch(), "usage-card")
 
     def test_a_refusal_publishes_nothing(self):
         remote = self.tmp / "remote.git"

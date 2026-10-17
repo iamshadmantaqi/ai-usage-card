@@ -74,8 +74,9 @@ def rates():
     }}
 
 
-def write_userdata(folder: Path, scan=None, cursor=None, rate_table=None) -> Path:
+def write_userdata(folder: Path, scan=None, cursor=None, rate_table=None, cursor_enabled=True) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
+    (folder / "settings.json").write_text(json.dumps({"cursorKeychainUsageEnabled": cursor_enabled}))
     (folder / "usage-scan-cache-v5.json").write_text(json.dumps(scan if scan is not None else scan_cache()))
     (folder / "usage-cursor-account-cache-v1.json").write_text(json.dumps(cursor if cursor is not None else cursor_cache()))
     (folder / "usage-model-rates.json").write_text(json.dumps(rate_table if rate_table is not None else rates()))
