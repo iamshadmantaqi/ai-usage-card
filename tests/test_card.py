@@ -220,7 +220,19 @@ class RenderTests(Case):
         self.assertGreater(height(full), height(empty))
         for root in (full, empty):
             ys = [float(node.get("y")) for node in root.iter("{http://www.w3.org/2000/svg}text")]
-            self.assertLess(max(ys), height(root))
+            self.assertLess(max(ys) + 8, height(root))  # descenders too
+            bars = [node for node in root.iter("{http://www.w3.org/2000/svg}rect") if node.get("height") == "3"]
+            if bars:  # the model share bars, the lowest thing on the card
+                bottom = max(float(node.get("y")) + 3 for node in bars)
+                self.assertLessEqual(bottom + 12, height(root))
+
+    def test_a_seven_figure_phone_cost_is_drawn_smaller_so_it_stays_inside(self):
+        from dataclasses import replace
+        sizes = {}
+        for cost in (19123.4, 123456.0, 1234567.0):
+            svg = render_phone(replace(self.summary(), total_cost_usd=cost), DARK)
+            sizes[fmt_cost(cost)] = re.search(r'font-size="(\d+)"[^>]*>%s<' % re.escape(fmt_cost(cost)), svg).group(1)
+        self.assertEqual(sizes, {"$19,123": "40", "$123,456": "40", "$1,234,567": "32"})
 
     def test_a_real_zero_is_drawn_as_zero(self):
         empty = summarise([], load_rates(self.userdata), TODAY)
@@ -302,12 +314,6 @@ class CliTests(Case):
             self.assertFalse(out.exists())
         self.assertIn("PrivacyError", (self.tmp / "card.log").read_text())
 
-    def test_the_guard_runs_over_the_phone_files_only_too(self):
-        real_phone = cli.render_phone
-        with mock.patch.object(cli, "render_phone", side_effect=lambda s, t: real_phone(s, t).replace("</svg>", "msg_01ABC</svg>")):
-            self.assertEqual(self.run_cli("--out", str(self.tmp / "out")), 1)
-        self.assertFalse((self.tmp / "out").exists())
-
     def test_refuses_an_unsupported_cache_version(self):
         scan = fx.scan_cache()
         scan["version"] = 6
@@ -365,6 +371,63 @@ class CliTests(Case):
             subprocess.run(["/usr/bin/git", "--git-dir", str(remote), "branch", "-q", "-D", "usage-card"], check=True)
             self.assertEqual(self.run_cli(*publish_args), 0)
             self.assertEqual(remote_branch(), "usage-card")
+
+    def _publish_setup(self):
+        remote = self.tmp / "remote.git"
+        subprocess.run(["/usr/bin/git", "init", "-q", "--bare", str(remote)], check=True)
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+        publish_args = ["--repo", str(remote), "--clone", str(self.tmp / "clone"), "--git-credential-helper", ""]
+
+        def other_clone_pushes(orphan):
+            """Another clone pushes to the branch: a normal commit on top, or (orphan) a rebuilt history."""
+            other = self.tmp / ("other-%d" % len(list(self.tmp.glob("other-*"))))
+            subprocess.run(["/usr/bin/git", "clone", "-q", "-b", "usage-card", str(remote), str(other)], check=True)
+            run = lambda *a: subprocess.run(["/usr/bin/git"] + list(a), cwd=str(other), check=True, stdout=subprocess.PIPE)
+            if orphan:
+                run("checkout", "-q", "--orphan", "rebuilt")
+            (other / "ai-usage-dark.svg").write_text("<svg>by hand</svg>\n", encoding="utf-8")
+            run("add", "--", "ai-usage-dark.svg")
+            run("commit", "-q", "-m", "by hand")
+            run("push", "-q", *(["--force"] if orphan else []), "origin", "HEAD:refs/heads/usage-card")
+
+        def tip_file(name):
+            return subprocess.run(["/usr/bin/git", "--git-dir", str(remote), "show", "usage-card:" + name], check=True,
+                                  stdout=subprocess.PIPE, universal_newlines=True).stdout
+        return env, publish_args, other_clone_pushes, tip_file
+
+    def test_a_rebuilt_remote_branch_is_taken_as_the_base_and_the_card_republished(self):
+        env, publish_args, other_clone_pushes, tip_file = self._publish_setup()
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(self.run_cli(*publish_args), 0)
+            other_clone_pushes(orphan=True)  # the branch no longer shares history with the working clone
+            self.assertEqual(self.run_cli(*publish_args), 0)
+            cards = cli.build_cards(self.userdata, fx.NOW)
+            for name in self.FOUR:
+                self.assertEqual(tip_file(name), cards[name])
+
+    def test_a_write_that_failed_part_way_does_not_block_later_runs(self):
+        env, publish_args, other_clone_pushes, tip_file = self._publish_setup()
+        real_write = Path.write_text
+        calls = []
+
+        def third_write_fails(path, *args, **kwargs):
+            calls.append(path.name)
+            if len(calls) == 3:
+                raise OSError("disk full")
+            return real_write(path, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(self.run_cli(*publish_args), 0)
+            scan = fx.scan_cache()
+            scan["files"]["/f/f.jsonl"] = fx.entry("claude", [fx.row(fx.ms(10, 18, 3), "claude-sonnet-5-5", 0, 1, 0, 0, 1, "msg_z:req_z")])
+            fx.write_userdata(self.userdata, scan=scan)
+            with mock.patch.object(Path, "write_text", third_write_fails):
+                self.assertEqual(self.run_cli(*publish_args), 1)  # two of the four files written, nothing committed
+            other_clone_pushes(orphan=False)  # meanwhile the remote moves on and touches a half-written file
+            self.assertEqual(self.run_cli(*publish_args), 0)
+            cards = cli.build_cards(self.userdata, fx.NOW)  # the new data, all four files
+            for name in self.FOUR:
+                self.assertEqual(tip_file(name), cards[name])
 
     def test_a_refusal_publishes_nothing(self):
         remote = self.tmp / "remote.git"

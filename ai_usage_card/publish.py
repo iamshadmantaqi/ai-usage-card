@@ -46,25 +46,24 @@ def _ensure_clone(clone: Path, repo_url: str, credential_helper: Optional[str]) 
 
 
 def _sync(clone: Path) -> bool:
-    """Bring the working clone level with the remote branch, and say whether the remote branch
-    exists. If it does not exist yet, the first commit becomes its orphan root."""
+    """Put the working clone on the remote branch, and say whether the remote branch exists. If it
+    does not exist yet, the first commit becomes its orphan root.
+
+    The remote is taken as it is, even when it was rebuilt or moved on from another clone, and any
+    half-written files from a failed run are dropped: this clone holds only generated files, and
+    all of them are written again straight after. A fast-forward merge here would stop every later
+    run on either of those states."""
     _git(clone, "fetch", "-q", "--prune", "origin")  # --prune: a deleted remote branch is seen as gone
     if not _git(clone, "branch", "-r", "--list", "origin/" + BRANCH).strip():
         return False
-    if _git(clone, "rev-parse", "-q", "--verify", "HEAD", check=False).strip():
-        _git(clone, "merge", "-q", "--ff-only", "origin/" + BRANCH)
-    else:
-        _git(clone, "checkout", "-q", "-B", BRANCH, "--track", "origin/" + BRANCH)
+    _git(clone, "checkout", "-q", "-f", "-B", BRANCH, "--track", "origin/" + BRANCH)
     return True
 
 
 def _unpushed(clone: Path, remote_exists: bool) -> bool:
-    """A local commit the remote branch lacks: an earlier push failed, or the branch was deleted."""
-    if not _git(clone, "rev-parse", "-q", "--verify", "HEAD", check=False).strip():
-        return False
-    if not remote_exists:
-        return True
-    return _git(clone, "rev-list", "--count", "origin/%s..HEAD" % BRANCH).strip() != "0"
+    """A local commit the remote branch lacks: the remote branch was never created (an earlier push
+    failed) or was deleted. When the remote branch exists, `_sync` has already put HEAD on it."""
+    return not remote_exists and bool(_git(clone, "rev-parse", "-q", "--verify", "HEAD", check=False).strip())
 
 
 def publish(files: Dict[str, str], repo_url: str, clone: Path, credential_helper: Optional[str] = None) -> bool:
