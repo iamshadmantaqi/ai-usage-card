@@ -183,18 +183,22 @@ def render_phone(summary: Summary, theme: Theme) -> str:
     """The phone card: 400 wide, one column, no text under 15 (about 11px at the 294px GitHub gives it on a 360px phone). Its height follows the rows."""
     t = theme
     left, right = 20, 380
+    tool_pitch, model_pitch = 26, 32
     tools_y = 346
-    models_head = tools_y + max(len(summary.tools), 1) * 26 + 22
+    models_head = tools_y + max(len(summary.tools), 1) * tool_pitch + 22
     models_y = models_head + 32
-    height = models_y + max(len(summary.models), 1) * 32 - 8 + 4
+    last_model_y = models_y + (max(len(summary.models), 1) - 1) * model_pitch
+    height = last_model_y + 28  # the last row's share bar ends 9 below its baseline; the rest is padding
     out = _open(summary, t, PHONE_WIDTH, height)
     add = out.append
+    cost = fmt_cost(summary.total_cost_usd)
+    cost_size = 40 if len(cost) <= 8 else 32  # "$123,456" fits between x=200 and the 380 margin at 40; "$1,234,567" does not
 
     add(_text(left, 38, "AI USAGE · LAST 30 DAYS", 15, t.muted, weight=700, family=MONO, spacing=2))
     add(_text(left, 60, "updated " + fmt_date(summary.updated), 15, t.muted))
     add(_text(left, 112, fmt_tokens(summary.total_tokens), 40, t.text, weight=800))
     add(_text(left, 134, "tokens", 15, t.muted))
-    add(_text(200, 112, fmt_cost(summary.total_cost_usd), 40, t.cost, weight=800))
+    add(_text(200, 112, cost, cost_size, t.cost, weight=800))
     add(_text(200, 134, "API-equivalent", 15, t.muted))
     add('<line x1="%d" y1="150" x2="%d" y2="150" stroke="%s" stroke-width="1"/>' % (left, right, t.border))
 
@@ -206,9 +210,9 @@ def render_phone(summary: Summary, theme: Theme) -> str:
     add(_text(right, 284, fmt_day(summary.last_day), 15, t.muted, anchor="end"))
 
     add(_heading(left, 318, "BY TOOL", t, 15))
-    out.extend(_tool_rows(summary, t, left, right, 250, tools_y, 26))
+    out.extend(_tool_rows(summary, t, left, right, 250, tools_y, tool_pitch))
 
     add(_heading(left, models_head, "TOP MODELS", t, 15))
-    out.extend(_model_rows(summary, t, left, right, 290, models_y, 32, 26))
+    out.extend(_model_rows(summary, t, left, right, 290, models_y, model_pitch, 26))
     add("</svg>")
     return "\n".join(out) + "\n"
