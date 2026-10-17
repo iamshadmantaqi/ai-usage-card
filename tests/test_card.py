@@ -208,10 +208,10 @@ class RenderTests(Case):
                 self.assertIn(text, svg)
         self.assertNotEqual(render_phone(self.summary(), LIGHT), render_phone(self.summary(), DARK))
 
-    def test_phone_text_is_never_smaller_than_14_so_it_stays_about_11px_at_330_wide(self):
+    def test_phone_text_is_never_smaller_than_15_so_it_stays_about_11px_at_294_wide(self):
         for theme in (LIGHT, DARK):
             sizes = [int(size) for size in re.findall(r'font-size="(\d+)"', render_phone(self.summary(), theme))]
-            self.assertGreaterEqual(min(sizes), 14)
+            self.assertGreaterEqual(min(sizes), 15)
 
     def test_the_phone_card_grows_with_its_rows_and_keeps_them_inside(self):
         full = ET.fromstring(render_phone(self.summary(), DARK))

@@ -1,7 +1,7 @@
 """Draw the card as SVG, light and dark, from a `Summary` and nothing else.
 
 Two layouts share the pieces below: the wide card (840 wide) and a narrow phone card (400 wide,
-one column, text no smaller than 14, so it stays readable when GitHub scales it to a 360px screen).
+one column, text no smaller than 15, so it stays readable when GitHub scales it to a 360px screen).
 Colours come from the profile's `assets/banner.svg` (dark navy panel, amber, coral, violet,
 teal and green accents). The caller runs `privacy.check_privacy` on the output.
 """
@@ -180,7 +180,7 @@ def render(summary: Summary, theme: Theme) -> str:
 
 
 def render_phone(summary: Summary, theme: Theme) -> str:
-    """The phone card: 400 wide, one column, no text under 14. Its height follows the rows."""
+    """The phone card: 400 wide, one column, no text under 15 (about 11px at the 294px GitHub gives it on a 360px phone). Its height follows the rows."""
     t = theme
     left, right = 20, 380
     tools_y = 346
@@ -190,25 +190,25 @@ def render_phone(summary: Summary, theme: Theme) -> str:
     out = _open(summary, t, PHONE_WIDTH, height)
     add = out.append
 
-    add(_text(left, 38, "AI USAGE · LAST 30 DAYS", 14, t.muted, weight=700, family=MONO, spacing=2))
-    add(_text(left, 60, "updated " + fmt_date(summary.updated), 14, t.muted))
+    add(_text(left, 38, "AI USAGE · LAST 30 DAYS", 15, t.muted, weight=700, family=MONO, spacing=2))
+    add(_text(left, 60, "updated " + fmt_date(summary.updated), 15, t.muted))
     add(_text(left, 112, fmt_tokens(summary.total_tokens), 40, t.text, weight=800))
-    add(_text(left, 134, "tokens", 14, t.muted))
+    add(_text(left, 134, "tokens", 15, t.muted))
     add(_text(200, 112, fmt_cost(summary.total_cost_usd), 40, t.cost, weight=800))
-    add(_text(200, 134, "API-equivalent", 14, t.muted))
+    add(_text(200, 134, "API-equivalent", 15, t.muted))
     add('<line x1="%d" y1="150" x2="%d" y2="150" stroke="%s" stroke-width="1"/>' % (left, right, t.border))
 
     peak = max([d.tokens for d in summary.daily] + [0])
-    add(_heading(left, 178, "TOKENS PER DAY", t, 14))
-    add(_text(right, 178, "peak " + fmt_tokens(peak), 14, t.muted, anchor="end"))
+    add(_heading(left, 178, "TOKENS PER DAY", t, 15))
+    add(_text(right, 178, "peak " + fmt_tokens(peak), 15, t.muted, anchor="end"))
     out.extend(_chart(summary, t, left, 260, right - left, 66))
-    add(_text(left, 284, fmt_day(summary.first_day), 14, t.muted))
-    add(_text(right, 284, fmt_day(summary.last_day), 14, t.muted, anchor="end"))
+    add(_text(left, 284, fmt_day(summary.first_day), 15, t.muted))
+    add(_text(right, 284, fmt_day(summary.last_day), 15, t.muted, anchor="end"))
 
-    add(_heading(left, 318, "BY TOOL", t, 14))
+    add(_heading(left, 318, "BY TOOL", t, 15))
     out.extend(_tool_rows(summary, t, left, right, 250, tools_y, 26))
 
-    add(_heading(left, models_head, "TOP MODELS", t, 14))
+    add(_heading(left, models_head, "TOP MODELS", t, 15))
     out.extend(_model_rows(summary, t, left, right, 290, models_y, 32, 26))
     add("</svg>")
     return "\n".join(out) + "\n"
