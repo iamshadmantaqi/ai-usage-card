@@ -49,6 +49,9 @@ class Tokens:
     cache_creation: int
     output: int
     reasoning: int
+    # Part of `cache_creation` that was written with the 1-hour lifetime (priced higher than the
+    # 5-minute default). T3's caches do not split writes, so there it is always 0.
+    cache_creation_1h: int = 0
 
     @property
     def total(self) -> int:

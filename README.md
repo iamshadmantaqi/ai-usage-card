@@ -4,8 +4,9 @@ A self-updating SVG card of my AI usage over the last 30 days, shown on my [GitH
 
 ## How it works
 
-1. It reads T3 Code's local usage cache (`~/.t3/userdata/usage-scan-cache-v5.json`, plus its Cursor and rate-table caches). T3 Code already scans every tool's transcripts, so there is no parser per tool here. T3 Code saves that cache when its usage page is open, so the card is as fresh as the last visit to that page; the 30 days end on the day of the newest record.
-2. It de-duplicates records and prices them the way T3 Code does, so the card matches T3 Code's own usage view. The record layouts are documented in `ai_usage_card/load.py`.
+1. Claude Code is read straight from its transcripts (`~/.claude/projects/**/*.jsonl`, subagent files included, each real folder once). A reply is written to a transcript several times while it streams and only the last copy has the final output count, so the copy with the most output is kept, once per `message.id:requestId`. Cache writes are priced at the 1-hour rate where the transcript says they were 1-hour writes. Only the model, the time and the token counts are taken from a line. T3 Code's own Claude records are ignored, because its cache keeps the first copy of each reply (about $1,500 short over 30 days) and prices every cache write at the 5-minute rate (about $870 short), together about 12% of Claude Code's cost.
+2. Everything else (Cursor, Codex, Grok and any other tool) comes from T3 Code's local usage cache (`~/.t3/userdata/usage-scan-cache-v5.json`, plus its Cursor and rate-table caches), which already scans those tools, so there is no parser for them here. T3 Code saves that cache when its usage page is open, so those tools are as fresh as the last visit to that page. The log gets a warning when its newest record is over 48 hours old. The 30 days always end today.
+   Records are de-duplicated and priced the way T3 Code does, from its cached LiteLLM rate table. The T3 record layouts are documented in `ai_usage_card/load.py`.
 3. It draws `ai-usage-light.svg`, `ai-usage-dark.svg`, `ai-usage-phone-light.svg` and `ai-usage-phone-dark.svg` and commits all four in one commit to the `usage-card` branch of the profile repo, only when the bytes of any changed.
 4. A launchd job on my Mac runs this daily at 06:00. It costs no AI tokens.
 
@@ -15,7 +16,7 @@ The cost is what the same tokens would cost at the public API list prices (from 
 
 ## Install
 
-Needs macOS, T3 Code's usage page opened now and then, the system Python 3 (`/usr/bin/python3`, standard library only) and `gh` signed in (`gh auth status`).
+Needs macOS, Claude Code's transcripts, T3 Code's usage page opened now and then (for the other tools), the system Python 3 (`/usr/bin/python3`, standard library only) and `gh` signed in (`gh auth status`).
 
 ```sh
 git clone https://github.com/iamshadmantaqi/ai-usage-card.git
@@ -30,7 +31,7 @@ To try it without publishing: `python3 -m ai_usage_card --out /tmp/card` writes 
 ## It refuses to publish when
 
 - the cache is missing, unparsable or not version 5, or T3 Code has started writing a newer version beside it;
-- the newest record is older than 48 hours (T3 Code's usage cache has not been refreshed);
+- the newest record from any source is older than 48 hours (a stale T3 Code cache alone only logs a warning);
 - the privacy guard trips.
 
 A refusal exits non-zero, logs the reason and commits nothing.
@@ -45,7 +46,7 @@ Only model names, tool names, dates and numbers reach the SVG. The renderer take
 python3 -m unittest discover -s tests -t .
 ```
 
-The tests use a small hand-made cache whose expected totals are written out as plain numbers.
+The tests use a small hand-made T3 cache and a few fixture transcripts whose expected totals are written out as plain numbers.
 
 ## Licence
 

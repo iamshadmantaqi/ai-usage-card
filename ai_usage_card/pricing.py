@@ -23,6 +23,7 @@ class TokenRates:
     output: float
     cache_read: float
     cache_creation: float
+    cache_creation_1h: float  # LiteLLM's `cache_creation_input_token_cost_above_1hr`, else the 5-minute rate
 
 
 @dataclass(frozen=True)
@@ -51,13 +52,15 @@ def _read_rates(entry: Dict[str, Any], suffix: str, standard: Optional[TokenRate
             return getattr(standard, field) / standard.input * inp
         return float(inp)
 
-    return TokenRates(float(inp), float(out), cache("cache_read_input_token_cost", "cache_read"),
-                      cache("cache_creation_input_token_cost", "cache_creation"))
+    creation = cache("cache_creation_input_token_cost", "cache_creation")
+    one_hour = entry.get("cache_creation_input_token_cost_above_1hr" + suffix)
+    return TokenRates(float(inp), float(out), cache("cache_read_input_token_cost", "cache_read"), creation,
+                      float(one_hour) if _num(one_hour) else creation)
 
 
 def _scale(rates: TokenRates, multiple: float) -> TokenRates:
     return TokenRates(rates.input * multiple, rates.output * multiple, rates.cache_read * multiple,
-                      rates.cache_creation * multiple)
+                      rates.cache_creation * multiple, rates.cache_creation_1h * multiple)
 
 
 def _fast_multiplier(entry: Dict[str, Any]) -> Optional[float]:
@@ -132,7 +135,9 @@ def price(table: Dict[str, ModelRates], record: UsageRecord) -> float:
         return reported if reported is not None else 0.0
     r = rate.at(record.speed)
     t = record.tokens
-    list_cost = t.uncached * r.input + t.cached * r.cache_read + t.cache_creation * r.cache_creation + t.output * r.output
+    one_hour = min(t.cache_creation_1h, t.cache_creation)
+    list_cost = (t.uncached * r.input + t.cached * r.cache_read + (t.cache_creation - one_hour) * r.cache_creation
+                 + one_hour * r.cache_creation_1h + t.output * r.output)
     if reported is not None and list_cost <= 0:
         return reported
     return reported if reported is not None else list_cost
