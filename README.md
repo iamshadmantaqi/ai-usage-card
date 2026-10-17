@@ -11,7 +11,7 @@ A self-updating SVG card of my AI usage over the last 30 days, shown on my [GitH
 
 ## Costs are API-equivalent
 
-The cost is what the same tokens would cost at the public API list prices (from the LiteLLM rate table that T3 Code caches). It is not what I paid: most of the work runs on subscriptions. A model with no known rate counts its tokens and adds $0.
+The cost is what the same tokens would cost at the public API list prices (from the LiteLLM rate table that T3 Code caches). It is not what I paid. A model with no known rate counts its tokens and adds $0.
 
 ## Install
 
