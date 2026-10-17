@@ -57,6 +57,24 @@ class LoadTests(Case):
         (self.userdata / "usage-cursor-account-cache-v1.json").unlink()
         self.assertEqual([r for r in load_records(self.userdata) if r.provider == "cursor"], [])
 
+    def test_cursor_default_model_is_shown_as_cursor_auto_at_the_same_cost(self):
+        strings = ["default", "agent-session"]
+        rows = [[fx.ms(10, 18, 3), 0, 1, 1000, 2000, 0, 500, None, "cursor-account:k:1:auto"]]
+        cursor = {"version": 1, "strings": strings, "accounts": {"keychain": {
+            "accountKey": "k", "sinceMs": 0, "untilMs": 1, "fetchedAtMs": 1, "records": rows}}}
+        table = fx.rates()
+        table["document"]["default"] = {"input_cost_per_token": 3e-6, "output_cost_per_token": 1e-5}
+        fx.write_userdata(self.userdata, cursor=cursor, rate_table=table)
+        rates = load_rates(self.userdata)
+        record = next(r for r in load_records(self.userdata) if r.dedupe_key == "cursor-account:k:1:auto")
+        self.assertEqual((record.model, record.rate_model), ("cursor-auto", "default"))
+        # priced through the original name: 3000 * 3e-6 + 500 * 1e-5
+        self.assertAlmostEqual(price(rates, record), 0.014, places=9)
+        self.assertEqual(price(rates, record), price(rates, record.__class__(**dict(record.__dict__, model="default"))))
+        labels = [m.label for m in self.summary().models]
+        self.assertIn("cursor-auto", labels)
+        self.assertNotIn("default", labels)
+
 
 class PricingTests(Case):
     def price_of(self, model):

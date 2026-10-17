@@ -143,6 +143,11 @@ def cursor_rate_model(model: str) -> str:
     return "xai/" + base if base.startswith("grok-") else base
 
 
+# Cursor's own names that mean nothing to a reader of the public card. Only the displayed name
+# changes: the rate lookup still sees the original (`cursor_rate_model` runs on the raw name).
+CURSOR_DISPLAY_NAMES = {"default": "cursor-auto"}  # Cursor records its Auto model as "default"
+
+
 def load_cursor_cache(path: Path) -> List[UsageRecord]:
     """Cursor's account usage. A missing file means no Cursor login, so no records."""
     if not path.exists():
@@ -171,7 +176,7 @@ def load_cursor_cache(path: Path) -> List[UsageRecord]:
             if (not _num(ts) or model is None or session is None or not all(_num(v) for v in (uncached, cached, creation, output))
                     or (cost is not None and not _num(cost)) or (key is not None and not isinstance(key, str))):
                 break
-            decoded.append(UsageRecord("cursor", int(ts), model, cursor_rate_model(model), session,
+            decoded.append(UsageRecord("cursor", int(ts), CURSOR_DISPLAY_NAMES.get(model, model), cursor_rate_model(model), session,
                                        Tokens(int(uncached), int(cached), int(creation), int(output), 0),
                                        float(cost) if cost is not None else None, "standard", key))
         else:
