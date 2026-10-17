@@ -4,7 +4,7 @@ A self-updating SVG card of my AI usage over the last 30 days, shown on my [GitH
 
 ## How it works
 
-1. Claude Code is read straight from its transcripts (`~/.claude/projects/**/*.jsonl`, subagent files included, each real folder once). A reply is written to a transcript several times while it streams and only the last copy has the final output count, so the copy with the most output is kept, once per `message.id:requestId`. Cache writes are priced at the 1-hour rate where the transcript says they were 1-hour writes. Only the model, the time and the token counts are taken from a line. T3 Code's own Claude records are ignored, because its cache keeps the first copy of each reply (about $1,500 short over 30 days) and prices every cache write at the 5-minute rate (about $870 short), together about 12% of Claude Code's cost.
+1. Claude Code is read straight from its transcripts (`~/.claude/projects/**/*.jsonl` and any other Claude folder T3 Code scans, subagent files included, each real folder and file once). A reply is written to a transcript several times while it streams and only the last copy has the final output count, so the copy with the most output is kept, once per message id (the request id when a line has no message id). Cache writes are priced at the 1-hour rate where the transcript says they were 1-hour writes. Only the model, the time and the token counts are taken from a line. T3 Code's own Claude records are ignored, because its cache keeps the first copy of each reply (about $1,500 short over 30 days) and prices every cache write at the 5-minute rate (about $870 short), together about 12% of Claude Code's cost.
 2. Everything else (Cursor, Codex, Grok and any other tool) comes from T3 Code's local usage cache (`~/.t3/userdata/usage-scan-cache-v5.json`, plus its Cursor and rate-table caches), which already scans those tools, so there is no parser for them here. T3 Code saves that cache when its usage page is open, so those tools are as fresh as the last visit to that page. The log gets a warning when its newest record is over 48 hours old. The 30 days always end today.
    Records are de-duplicated and priced the way T3 Code does, from its cached LiteLLM rate table. The T3 record layouts are documented in `ai_usage_card/load.py`.
 3. It draws `ai-usage-light.svg`, `ai-usage-dark.svg`, `ai-usage-phone-light.svg` and `ai-usage-phone-dark.svg` and commits all four in one commit to the `usage-card` branch of the profile repo, only when the bytes of any changed.
@@ -32,6 +32,7 @@ To try it without publishing: `python3 -m ai_usage_card --out /tmp/card` writes 
 
 - the cache is missing, unparsable or not version 5, or T3 Code has started writing a newer version beside it;
 - the newest record from any source is older than 48 hours (a stale T3 Code cache alone only logs a warning);
+- no Claude Code transcripts folder exists, a transcripts folder or file cannot be read, or T3 Code has Claude Code usage in the window while the transcripts give none;
 - the privacy guard trips.
 
 A refusal exits non-zero, logs the reason and commits nothing.

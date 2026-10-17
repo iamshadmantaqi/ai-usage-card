@@ -135,8 +135,7 @@ def _decode_scan_rows(rows: Any, provider: str, models: List[str], sessions: Lis
     return records
 
 
-def load_scan_cache(path: Path, min_file_mtime_ms: float = 0) -> List[List[UsageRecord]]:
-    """Records per transcript file, in cache order. Files older than `min_file_mtime_ms` are left out, as T3 does."""
+def _read_scan_document(path: Path) -> Dict[str, Any]:
     _refuse_newer_version(path.parent, "usage-scan-cache-v", SCAN_CACHE_VERSION)
     document = _read_json(path)
     if not isinstance(document, dict) or document.get("version") != SCAN_CACHE_VERSION:
@@ -145,8 +144,13 @@ def load_scan_cache(path: Path, min_file_mtime_ms: float = 0) -> List[List[Usage
     if (not isinstance(models, list) or not isinstance(sessions, list) or not isinstance(files, dict)
             or not all(isinstance(m, str) for m in models) or not all(isinstance(s, str) for s in sessions)):
         raise CacheError("scan cache has an unexpected shape")
+    return document
+
+
+def _scan_records(document: Dict[str, Any], min_file_mtime_ms: float) -> List[List[UsageRecord]]:
+    models, sessions = document["models"], document["sessions"]
     per_file = []  # type: List[List[UsageRecord]]
-    for entry in files.values():
+    for entry in document["files"].values():
         if not isinstance(entry, dict) or not _num(entry.get("s")) or not _num(entry.get("m")):
             continue
         provider = entry.get("p")
@@ -158,6 +162,25 @@ def load_scan_cache(path: Path, min_file_mtime_ms: float = 0) -> List[List[Usage
             continue
         per_file.append(head + tail)
     return per_file
+
+
+def _claude_folders(document: Dict[str, Any]) -> List[str]:
+    """The Claude Code transcript folders T3 scans: `sources` maps "claude\\0<folder>" to {dir: <real folder>}."""
+    sources = document.get("sources")
+    folders = []  # type: List[str]
+    for key, value in (sources.items() if isinstance(sources, dict) else ()):
+        provider, _, folder = key.partition("\0") if isinstance(key, str) else ("", "", "")
+        if provider != "claude":
+            continue
+        for candidate in (folder, value.get("dir") if isinstance(value, dict) else None):
+            if isinstance(candidate, str) and candidate and candidate not in folders:
+                folders.append(candidate)
+    return folders
+
+
+def load_scan_cache(path: Path, min_file_mtime_ms: float = 0) -> List[List[UsageRecord]]:
+    """Records per transcript file, in cache order. Files older than `min_file_mtime_ms` are left out, as T3 does."""
+    return _scan_records(_read_scan_document(path), min_file_mtime_ms)
 
 
 def cursor_rate_model(model: str) -> str:
@@ -245,7 +268,9 @@ def dedupe(per_file: List[List[UsageRecord]]) -> List[UsageRecord]:
     """Global de-duplication by dedupe key, first copy wins, exactly as T3's aggregator does.
 
     Claude Code copies a message's records forward when a session is resumed or forked, so the
-    same `message.id:requestId` key legitimately appears in several transcripts.
+    same `message.id:requestId` key legitimately appears in several transcripts. (The card reads
+    Claude Code from its transcripts instead, see `claude.py`; T3's Claude records are only checked
+    for presence.)
     """
     shared = _shared_sessions(per_file)
     seen = set()  # type: Set[str]
@@ -267,9 +292,16 @@ def dedupe(per_file: List[List[UsageRecord]]) -> List[UsageRecord]:
     return kept
 
 
-def load_records(userdata_dir: Path, min_file_mtime_ms: float = 0) -> List[UsageRecord]:
-    """Every usage record T3 Code knows about, de-duplicated. Raises CacheError if the scan cache is unusable."""
-    per_file = load_scan_cache(userdata_dir / SCAN_CACHE_FILE, min_file_mtime_ms)
+def load_t3(userdata_dir: Path, min_file_mtime_ms: float = 0) -> Tuple[List[UsageRecord], List[str]]:
+    """Every usage record T3 Code knows about, de-duplicated, and the Claude Code transcript folders
+    it scans (used only to read those folders, never stored). Raises CacheError if the scan cache is unusable."""
+    document = _read_scan_document(userdata_dir / SCAN_CACHE_FILE)
+    per_file = _scan_records(document, min_file_mtime_ms)
     enabled = cursor_usage_enabled(userdata_dir / SETTINGS_FILE)
     cursor = load_cursor_cache(userdata_dir / CURSOR_CACHE_FILE) if enabled else []
-    return dedupe(per_file + [cursor])
+    return dedupe(per_file + [cursor]), _claude_folders(document)
+
+
+def load_records(userdata_dir: Path, min_file_mtime_ms: float = 0) -> List[UsageRecord]:
+    """Every usage record T3 Code knows about, de-duplicated. Raises CacheError if the scan cache is unusable."""
+    return load_t3(userdata_dir, min_file_mtime_ms)[0]

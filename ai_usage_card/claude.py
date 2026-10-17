@@ -17,9 +17,9 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
-from .load import Tokens, UsageRecord, _num
+from .load import CacheError, Tokens, UsageRecord, _num
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 _FRACTION = re.compile(r"\.(\d+)")
@@ -43,31 +43,45 @@ def _count(value: Any) -> int:
     return int(value) if _num(value) and value > 0 else 0
 
 
-def transcript_files(root: Path, min_mtime_ms: float = 0) -> Iterator[str]:
-    """Every transcript under `root`, each real directory and file once. Some project folders are
-    symlinks to others (and the root itself may be one), so directories are tracked by real path."""
-    seen_dirs = set()  # type: set
-    seen_files = set()  # type: set
-    for folder, subfolders, names in os.walk(str(root), followlinks=True):
-        real = os.path.realpath(folder)
-        if real in seen_dirs:
-            subfolders[:] = []
+def _unreadable(error: OSError) -> None:
+    # A folder that cannot be listed would drop its usage from the card without a trace.
+    raise CacheError("a Claude Code transcripts folder cannot be read (%s)" % type(error).__name__)
+
+
+def transcript_files(roots: Iterable[Path], min_mtime_ms: float = 0) -> Iterator[str]:
+    """Every transcript under `roots`, each real directory and file once. Some project folders are
+    symlinks to others (and a root itself may be one, or the same folder as another root), so
+    directories and files are tracked by real path, which also stops a symlink cycle.
+
+    A root that does not exist is skipped (the caller refuses when none does); a folder or file that
+    exists but cannot be read raises CacheError, so the card is never published short."""
+    seen_dirs = set()  # type: Set[str]
+    seen_files = set()  # type: Set[str]
+    for root in roots:
+        if not os.path.isdir(str(root)):
             continue
-        seen_dirs.add(real)
-        subfolders.sort()
-        for name in sorted(names):
-            if not name.endswith(".jsonl"):
+        for folder, subfolders, names in os.walk(str(root), onerror=_unreadable, followlinks=True):
+            real = os.path.realpath(folder)
+            if real in seen_dirs:
+                subfolders[:] = []
                 continue
-            path = os.path.join(real, name)
-            if path in seen_files:
-                continue
-            seen_files.add(path)
-            try:
-                if os.stat(path).st_mtime * 1000 < min_mtime_ms:
+            seen_dirs.add(real)
+            subfolders.sort()
+            for name in sorted(names):
+                if not name.endswith(".jsonl"):
                     continue
-            except OSError:
-                continue
-            yield path
+                path = os.path.realpath(os.path.join(real, name))
+                if path in seen_files:
+                    continue
+                seen_files.add(path)
+                try:
+                    if os.stat(path).st_mtime * 1000 < min_mtime_ms:
+                        continue
+                except FileNotFoundError:  # a broken symlink, or removed since the folder was listed
+                    continue
+                except OSError as error:
+                    _unreadable(error)
+                yield path
 
 
 def _record_from_line(line: str) -> Optional[Tuple[Tuple[Any, ...], UsageRecord]]:
@@ -93,18 +107,25 @@ def _record_from_line(line: str) -> Optional[Tuple[Tuple[Any, ...], UsageRecord]
                     five + hour, _count(usage.get("output_tokens")), 0, hour)
     if not tokens.total:
         return None
+    # A message id is unique to one API response, and some lines carry it without a request id, so
+    # it is the key on its own; the request id is used only when the message id is missing.
     msg_id, request_id = message.get("id"), row.get("requestId")
-    key = (msg_id, request_id) if isinstance(msg_id, str) or isinstance(request_id, str) else None
+    key = (("m", msg_id) if isinstance(msg_id, str) and msg_id
+           else ("r", request_id) if isinstance(request_id, str) and request_id else None)
     speed = "fast" if usage.get("speed") == "fast" else "standard"
     return key, UsageRecord("claude", ts, model, None, "", tokens, None, speed, None)
 
 
-def load_claude_records(root: Path = PROJECTS_DIR, min_file_mtime_ms: float = 0) -> List[UsageRecord]:
+def load_claude_records(roots: Iterable[Path] = (PROJECTS_DIR,), min_file_mtime_ms: float = 0) -> List[UsageRecord]:
     """One record per assistant reply. A reply is written several times (streaming) and a resumed
-    or forked chat copies its history, so a reply is kept once, as the copy with the most output."""
+    or forked chat copies its history, so a reply is kept once, as the copy with the most output.
+    Raises CacheError when no root exists or a transcript cannot be read."""
+    roots = list(roots)
+    if not any(os.path.isdir(str(root)) for root in roots):
+        raise CacheError("no Claude Code transcripts folder found")
     best = {}  # type: Dict[Tuple[Any, ...], UsageRecord]
     unkeyed = []  # type: List[UsageRecord]
-    for path in transcript_files(root, min_file_mtime_ms):
+    for path in transcript_files(roots, min_file_mtime_ms):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
                 for line in handle:
@@ -118,6 +139,8 @@ def load_claude_records(root: Path = PROJECTS_DIR, min_file_mtime_ms: float = 0)
                         unkeyed.append(record)
                     elif key not in best or record.tokens.output > best[key].tokens.output:
                         best[key] = record
-        except OSError:
+        except FileNotFoundError:  # removed since the folder was listed
             continue
+        except OSError as error:
+            _unreadable(error)
     return list(best.values()) + unkeyed

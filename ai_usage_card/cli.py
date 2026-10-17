@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 
 from . import publish as publisher
 from .claude import PROJECTS_DIR, load_claude_records
-from .load import CacheError, UsageRecord, load_records
+from .load import CacheError, UsageRecord, load_t3
 from .pricing import load_rates
 from .privacy import PrivacyError, check_privacy
 from .render import DARK, LIGHT, fmt_cost, fmt_tokens, render, render_phone
@@ -39,15 +39,20 @@ class Refused(Exception):
 def gather(userdata: Path, projects: Path, now: datetime) -> Tuple[List[UsageRecord], Optional[int]]:
     """Records for the window, and the timestamp of T3 Code's newest record (None if it has none).
 
-    Claude Code comes from its own transcripts (see `claude.py`); T3's Claude records are dropped so
-    nothing is counted twice. Everything else stays on T3's caches."""
+    Claude Code comes from its own transcripts (see `claude.py`), read from `projects` and from every
+    Claude folder T3 scans; T3's Claude records are dropped so nothing is counted twice. Everything
+    else stays on T3's caches. Refuses when T3 has Claude usage in the window and the transcripts give
+    none, which means Claude Code's data has moved out of reach."""
     now_ms = int(now.timestamp() * 1000)
     floor_ms = window_start_ms(now.astimezone(TIMEZONE).date()) - FILE_SLACK_MS
     # A timestamp in the future (clock skew, a bad row) would defeat the age check in build_cards.
     in_range = lambda r: floor_ms <= r.timestamp_ms <= now_ms
-    t3 = [r for r in load_records(userdata, floor_ms) if in_range(r)]
+    t3_records, t3_claude_folders = load_t3(userdata, floor_ms)
+    t3 = [r for r in t3_records if in_range(r)]
     t3_newest = max((r.timestamp_ms for r in t3), default=None)
-    claude = [r for r in load_claude_records(projects, floor_ms) if in_range(r)]
+    claude = [r for r in load_claude_records([projects] + [Path(f) for f in t3_claude_folders], floor_ms) if in_range(r)]
+    if not claude and any(r.provider == "claude" for r in t3):
+        raise Refused("T3 Code has Claude Code usage in the window but its transcripts gave none")
     return [r for r in t3 if r.provider != "claude"] + claude, t3_newest
 
 
@@ -82,7 +87,7 @@ def build_cards(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR) ->
 def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> int:
     parser = argparse.ArgumentParser(prog="ai_usage_card", description=__doc__)
     parser.add_argument("--userdata", type=Path, default=DEFAULT_USERDATA, help="T3 Code's userdata folder")
-    parser.add_argument("--claude-projects", type=Path, default=PROJECTS_DIR, help="Claude Code's transcripts folder")
+    parser.add_argument("--claude-projects", type=Path, default=PROJECTS_DIR, help="Claude Code's transcripts folder (the Claude folders T3 Code scans are read as well)")
     parser.add_argument("--out", type=Path, help="write the SVGs here and do not publish")
     parser.add_argument("--repo", default=DEFAULT_REPO, help="profile repo to publish to")
     parser.add_argument("--clone", type=Path, default=DEFAULT_CLONE, help="working clone used for publishing")

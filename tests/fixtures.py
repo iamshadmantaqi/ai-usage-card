@@ -86,11 +86,14 @@ def write_userdata(folder: Path, scan=None, cursor=None, rate_table=None, cursor
 
 
 def reply(model, when, usage, msg="msg_x", req="req_x", kind="assistant"):
-    """One transcript line. `when` is (month, day, hour) in UTC. Extra keys mimic Claude Code's real lines."""
-    ts = datetime(2026, when[0], when[1], when[2], 0, 0, 123000).isoformat() + "Z"
-    return json.dumps({"type": kind, "timestamp": ts, "requestId": req, "uuid": "u-" + msg, "cwd": "/Users/someone/secret",
-                       "message": {"id": msg, "model": model, "role": "assistant",
-                                   "content": [{"type": "text", "text": "private words"}], "usage": usage}})
+    """One transcript line. `when` is (month, day, hour[, year]) in UTC; `req=None` leaves the request id out. Extra keys mimic Claude Code's real lines."""
+    ts = "%04d-%02d-%02dT%02d:00:00.123Z" % (when[3] if len(when) > 3 else 2026, when[0], when[1], when[2])  # 3 digits, as Claude Code writes
+    line = {"type": kind, "timestamp": ts, "uuid": "u-%s" % msg, "cwd": "/Users/someone/secret",
+            "message": {"id": msg, "model": model, "role": "assistant",
+                        "content": [{"type": "text", "text": "private words"}], "usage": usage}}
+    if req is not None:
+        line["requestId"] = req
+    return json.dumps(line)
 
 
 def usage(inp, out, read=0, five=None, hour=None, whole=None, speed=None):

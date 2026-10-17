@@ -11,9 +11,9 @@ from pathlib import Path
 from unittest import mock
 
 from ai_usage_card import cli, publish
-from ai_usage_card.claude import load_claude_records, transcript_files
+from ai_usage_card.claude import _timestamp_ms, load_claude_records, transcript_files
 from ai_usage_card.load import CacheError, load_records
-from ai_usage_card.pricing import load_rates, price
+from ai_usage_card.pricing import load_rates, parse_rate_table, price
 from ai_usage_card.privacy import PrivacyError, check_privacy
 from ai_usage_card.render import DARK, LIGHT, fmt_cost, fmt_tokens, render, render_phone
 from ai_usage_card.summarise import summarise
@@ -110,7 +110,7 @@ class LoadTests(Case):
 
 class ClaudeTranscriptTests(Case):
     def claude(self, min_file_mtime_ms=fx.ms(9, 1, 0)):
-        return load_claude_records(self.projects, min_file_mtime_ms)
+        return load_claude_records([self.projects], min_file_mtime_ms)
 
     def test_a_reply_written_three_times_counts_once_with_its_final_output(self):
         x = [r for r in self.claude() if r.tokens.output == 3000]
@@ -123,11 +123,52 @@ class ClaudeTranscriptTests(Case):
         self.assertEqual(sorted(r.tokens.total for r in records), [170, 300, 5100])  # X, Y (subagent), F; synthetic, user and broken lines out
 
     def test_each_transcript_is_read_once_through_a_symlinked_folder_or_root(self):
-        names = lambda root: sorted(os.path.relpath(p, os.path.realpath(str(root))) for p in transcript_files(root))
+        names = lambda *roots: sorted(os.path.relpath(p, os.path.realpath(str(self.projects))) for p in transcript_files(roots))
         expected = ["-proj-a/chat1.jsonl", "-proj-a/chat1/subagents/agent-1.jsonl", "-proj-a/chat2.jsonl", "-proj-old/old.jsonl"]
         self.assertEqual(names(self.projects), expected)
         os.symlink(str(self.projects), str(self.tmp / "alt"))  # like ~/.claude-alt/projects
         self.assertEqual(names(self.tmp / "alt"), expected)
+        self.assertEqual(names(self.projects, self.tmp / "alt", self.tmp / "missing"), expected)  # T3 lists both
+
+    def test_a_symlinked_transcript_file_and_a_symlink_cycle_are_read_once(self):
+        os.symlink(str(self.projects / "-proj-a" / "chat2.jsonl"), str(self.projects / "-proj-old" / "linked.jsonl"))
+        os.symlink(str(self.projects), str(self.projects / "-proj-a" / "loop"))
+        os.symlink(str(self.tmp / "gone.jsonl"), str(self.projects / "-proj-old" / "broken.jsonl"))
+        paths = list(transcript_files([self.projects]))
+        self.assertEqual(len(paths), 4)
+        self.assertEqual(len(set(paths)), 4)
+
+    def test_a_missing_or_unreadable_transcripts_folder_or_file_is_refused(self):
+        with self.assertRaisesRegex(CacheError, "no Claude Code transcripts folder"):
+            load_claude_records([self.tmp / "missing"])
+        for target in (self.projects / "-proj-a" / "chat1" / "subagents", self.projects / "-proj-a" / "chat2.jsonl"):
+            os.chmod(str(target), 0)
+            self.addCleanup(os.chmod, str(target), 0o755)
+            with self.assertRaisesRegex(CacheError, "cannot be read \\(PermissionError\\)"):
+                self.claude()
+            os.chmod(str(target), 0o755)
+
+    def test_a_copy_without_a_request_id_is_still_the_same_reply(self):
+        fx.write_lines(self.projects / "-proj-b" / "fork.jsonl", [
+            fx.reply("claude-opus-5-5", (10, 17, 6), fx.usage(100, 3000, read=1000, five=400, hour=600), req=None)])
+        self.assertEqual(sorted(r.tokens.total for r in self.claude()), [170, 300, 5100])
+
+    def test_empty_ids_do_not_merge_different_replies(self):
+        fx.write_lines(self.projects / "-proj-b" / "odd.jsonl", [
+            fx.reply("claude-opus-5-5", (10, 17, 8), fx.usage(1, 1), msg="", req="req_p"),
+            fx.reply("claude-opus-5-5", (10, 17, 8), fx.usage(2, 2), msg="", req="req_q"),
+            fx.reply("claude-opus-5-5", (10, 17, 8), fx.usage(3, 3), msg="", req="")])
+        self.assertEqual(sorted(r.tokens.total for r in self.claude()), [2, 4, 6, 170, 300, 5100])
+
+    def test_claude_code_timestamps_are_read_with_any_fraction_length(self):
+        self.assertEqual(_timestamp_ms("2026-10-17T06:00:00.123Z"), 1792216800123)
+        self.assertEqual(_timestamp_ms("2026-10-17T06:00:00.123456Z"), 1792216800123)
+        self.assertEqual(_timestamp_ms("2026-10-17T06:00:00.1234567Z"), 1792216800123)
+        self.assertEqual(_timestamp_ms("2026-10-17T06:00:00.1Z"), 1792216800100)
+        self.assertEqual(_timestamp_ms("2026-10-17T12:00:00+06:00"), 1792216800000)
+        self.assertEqual(_timestamp_ms("2026-10-17T06:00:00"), 1792216800000)  # no zone is UTC
+        for bad in ("2026-13-17T06:00:00Z", "yesterday", 1792216800123, None):
+            self.assertIsNone(_timestamp_ms(bad))
 
     def test_files_last_written_before_the_window_are_skipped(self):
         self.assertEqual(len(self.claude()), 3)
@@ -156,6 +197,23 @@ class ClaudeTranscriptTests(Case):
             self.assertNotIn("private", repr(record))
             self.assertNotIn("secret", repr(record))
 
+    def test_the_claude_folders_t3_scans_are_read_too_without_double_counting(self):
+        other = self.tmp / "other-account" / "projects"
+        fx.write_lines(other / "-proj-z" / "chat.jsonl", [fx.reply("claude-opus-5-5", (10, 17, 9), fx.usage(30, 70), msg="msg_z", req="req_z")])
+        scan = fx.scan_cache()
+        scan["sources"] = {"claude\0" + str(self.tmp / "alt"): {"dir": str(self.projects)},
+                           "claude\0" + str(other): {"dir": str(other)},
+                           "codex\0" + str(self.tmp / "codex"): {"dir": str(self.tmp / "codex")}}
+        fx.write_userdata(self.userdata, scan=scan)
+        records, _ = cli.gather(self.userdata, self.projects, fx.NOW)
+        self.assertEqual(sorted(r.tokens.total for r in records if r.provider == "claude"), [100, 170, 300, 5100])
+
+    def test_refuses_when_t3_has_claude_usage_but_the_transcripts_give_none(self):
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        with self.assertRaisesRegex(cli.Refused, "transcripts gave none"):
+            cli.gather(self.userdata, empty, fx.NOW)
+
     def test_t3s_claude_records_are_ignored_but_its_other_tools_still_count(self):
         records, t3_newest = cli.gather(self.userdata, self.projects, fx.NOW)
         s = summarise(records, load_rates(self.userdata), TODAY)
@@ -168,6 +226,15 @@ class ClaudeTranscriptTests(Case):
 
 
 class PricingTests(Case):
+    def test_a_priority_tier_without_a_one_hour_rate_keeps_the_standard_ratio(self):
+        table = parse_rate_table({"m": {"input_cost_per_token": 1e-6, "output_cost_per_token": 5e-6,
+                                        "cache_creation_input_token_cost": 1.25e-6, "cache_creation_input_token_cost_above_1hr": 2e-6,
+                                        "input_cost_per_token_priority": 2e-6, "output_cost_per_token_priority": 1e-5}})
+        self.assertAlmostEqual(table["m"].fast.cache_creation, 2.5e-6, places=15)
+        self.assertAlmostEqual(table["m"].fast.cache_creation_1h, 4e-6, places=15)  # not 2.5e-6, the 5-minute rate
+        self.assertAlmostEqual(table["m"].standard.cache_creation_1h, 2e-6, places=15)
+
+
     def price_of(self, model):
         rates = load_rates(self.userdata)
         record = next(r for r in load_records(self.userdata) if r.model == model)
@@ -375,6 +442,18 @@ class CliTests(Case):
         self.assertIn("updated 18 Oct 2026", (out / "ai-usage-dark.svg").read_text())
         # with only a future record, the age check still refuses
         self.assertEqual(self.run_cli("--out", str(out), now=fx.NOW + timedelta(hours=49)), 1)
+
+    def test_a_future_dated_transcript_line_does_not_hide_a_stale_card(self):
+        fx.write_lines(self.projects / "-proj-a" / "chat4.jsonl",
+                       [fx.reply("claude-opus-5-5", (1, 1, 1, 2030), fx.usage(10, 10), msg="msg_2030", req="req_2030")], mtime_ms=fx.ms(10, 18, 3))
+        self.assertEqual(self.run_cli("--out", str(self.tmp / "out"), now=fx.NOW + timedelta(hours=49)), 1)
+        self.assertIn("no source has recent usage", (self.tmp / "card.log").read_text())
+
+    def test_a_missing_transcripts_folder_publishes_nothing(self):
+        out = self.tmp / "out"
+        self.assertEqual(self.run_cli("--out", str(out), "--claude-projects", str(self.tmp / "missing")), 1)
+        self.assertFalse(out.exists())
+        self.assertIn("no Claude Code transcripts folder found", (self.tmp / "card.log").read_text())
 
     def test_refuses_when_the_privacy_guard_trips_on_any_of_the_four(self):
         for name in ("render", "render_phone"):
