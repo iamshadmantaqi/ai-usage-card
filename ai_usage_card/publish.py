@@ -45,29 +45,40 @@ def _ensure_clone(clone: Path, repo_url: str, credential_helper: Optional[str]) 
             _git(clone, "config", key, value)
 
 
-def _sync(clone: Path) -> None:
-    """Bring the working clone level with the remote branch. If the branch does not exist yet,
-    the first commit becomes its orphan root."""
-    _git(clone, "fetch", "-q", "origin")
-    remote = _git(clone, "branch", "-r", "--list", "origin/" + BRANCH).strip()
-    if not remote:
-        return
+def _sync(clone: Path) -> bool:
+    """Bring the working clone level with the remote branch, and say whether the remote branch
+    exists. If it does not exist yet, the first commit becomes its orphan root."""
+    _git(clone, "fetch", "-q", "--prune", "origin")  # --prune: a deleted remote branch is seen as gone
+    if not _git(clone, "branch", "-r", "--list", "origin/" + BRANCH).strip():
+        return False
     if _git(clone, "rev-parse", "-q", "--verify", "HEAD", check=False).strip():
         _git(clone, "merge", "-q", "--ff-only", "origin/" + BRANCH)
     else:
         _git(clone, "checkout", "-q", "-B", BRANCH, "--track", "origin/" + BRANCH)
+    return True
+
+
+def _unpushed(clone: Path, remote_exists: bool) -> bool:
+    """A local commit the remote branch lacks: an earlier push failed, or the branch was deleted."""
+    if not _git(clone, "rev-parse", "-q", "--verify", "HEAD", check=False).strip():
+        return False
+    if not remote_exists:
+        return True
+    return _git(clone, "rev-list", "--count", "origin/%s..HEAD" % BRANCH).strip() != "0"
 
 
 def publish(files: Dict[str, str], repo_url: str, clone: Path, credential_helper: Optional[str] = None) -> bool:
-    """Write `files` into the clone, commit and push if any byte changed. Returns True if it pushed."""
+    """Write `files` into the clone, commit if any byte changed, and push whatever the remote
+    branch lacks. Returns True if it pushed."""
     _ensure_clone(clone, repo_url, credential_helper)
-    _sync(clone)
+    remote_exists = _sync(clone)
     names = sorted(files)
     for name in names:
         (clone / name).write_text(files[name], encoding="utf-8")
-    if not _git(clone, "status", "--porcelain", "--", *names).strip():
+    if _git(clone, "status", "--porcelain", "--", *names).strip():
+        _git(clone, "add", "--", *names)
+        _git(clone, "commit", "-q", "-m", COMMIT_MESSAGE)
+    elif not _unpushed(clone, remote_exists):
         return False
-    _git(clone, "add", "--", *names)
-    _git(clone, "commit", "-q", "-m", COMMIT_MESSAGE)
-    _git(clone, "push", "-q", "-u", "origin", BRANCH)
+    _git(clone, "push", "-q", "-u", "origin", "%s:refs/heads/%s" % (BRANCH, BRANCH))
     return True
