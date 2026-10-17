@@ -1,5 +1,7 @@
 """Draw the card as SVG, light and dark, from a `Summary` and nothing else.
 
+Two layouts share the pieces below: the wide card (840 wide) and a narrow phone card (400 wide,
+one column, text no smaller than 14, so it stays readable when GitHub scales it to a 360px screen).
 Colours come from the profile's `assets/banner.svg` (dark navy panel, amber, coral, violet,
 teal and green accents). The caller runs `privacy.check_privacy` on the output.
 """
@@ -13,6 +15,7 @@ from xml.sax.saxutils import escape
 from .summarise import Summary
 
 WIDTH, HEIGHT = 840, 392
+PHONE_WIDTH = 400
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 SANS = "'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
 MONO = "'Courier New', ui-monospace, monospace"
@@ -95,17 +98,60 @@ def _chart(summary: Summary, theme: Theme, x0: float, baseline: float, width: fl
     return parts
 
 
-def render(summary: Summary, theme: Theme) -> str:
-    t = theme
+def _heading(x: float, y: float, label: str, theme: Theme, size: int = 13) -> str:
+    return _text(x, y, label, size, theme.muted, weight=700, family=MONO, spacing=2)
+
+
+def _open(summary: Summary, theme: Theme, width: int, height: int) -> List[str]:
+    """The svg tag, the background and the border."""
+    label = "AI usage over the last 30 days: %s tokens, %s API-equivalent" % (fmt_tokens(summary.total_tokens), fmt_cost(summary.total_cost_usd))
+    return [
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d" role="img" aria-label="%s">'
+        % (width, height, width, height, escape(label)),
+        '<defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="%s"/><stop offset="1" stop-color="%s"/></linearGradient></defs>'
+        % (theme.bg_from, theme.bg_to),
+        '<rect width="%d" height="%d" rx="16" fill="url(#bg)"/>' % (width, height),
+        '<rect x="0.75" y="0.75" width="%s" height="%s" rx="15.5" fill="none" stroke="%s" stroke-width="1.5"/>'
+        % (width - 1.5, height - 1.5, theme.border),
+    ]
+
+
+def _tool_rows(summary: Summary, t: Theme, x: float, right: float, tokens_x: float, y0: float, pitch: float) -> List[str]:
     out = []
+    for i, tool in enumerate(summary.tools):
+        y = y0 + i * pitch
+        colour = t.tools.get(tool.label, t.tools["default"])
+        out.append('<circle cx="%s" cy="%s" r="5" fill="%s"/>' % (x + 6, y - 5, colour))
+        out.append(_text(x + 20, y, _clip(tool.label, 16), 15, t.text))
+        out.append(_text(tokens_x, y, fmt_tokens(tool.tokens), 15, t.text, anchor="end", weight=700))
+        out.append(_text(right, y, fmt_cost(tool.cost_usd), 15, t.cost, anchor="end"))
+    if not summary.tools:
+        out.append(_text(x, y0, "No usage in this period", 15, t.muted))
+    return out
+
+
+def _model_rows(summary: Summary, t: Theme, x: float, right: float, tokens_x: float, y0: float, pitch: float, clip: int) -> List[str]:
+    out = []
+    bar_width = right - x
+    for i, model in enumerate(summary.models):
+        y = y0 + i * pitch
+        share = model.tokens / summary.total_tokens if summary.total_tokens else 0
+        out.append(_text(x, y, _clip(model.label, clip), 15, t.muted if model.label == "other" else t.text))
+        out.append(_text(tokens_x, y, fmt_tokens(model.tokens), 15, t.text, anchor="end", weight=700))
+        out.append(_text(right, y, fmt_cost(model.cost_usd), 15, t.cost, anchor="end"))
+        out.append('<rect x="%s" y="%s" width="%s" height="3" rx="1.5" fill="%s"/>' % (x, y + 6, bar_width, t.track))
+        if share > 0:
+            out.append('<rect x="%s" y="%s" width="%s" height="3" rx="1.5" fill="%s"/>' % (x, y + 6, max(2.0, round(bar_width * share, 2)), t.models))
+    if not summary.models:
+        out.append(_text(x, y0, "No usage in this period", 15, t.muted))
+    return out
+
+
+def render(summary: Summary, theme: Theme) -> str:
+    """The wide card, 840 x 392."""
+    t = theme
+    out = _open(summary, t, WIDTH, HEIGHT)
     add = out.append
-    add('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d" role="img" aria-label="%s">'
-        % (WIDTH, HEIGHT, WIDTH, HEIGHT, escape("AI usage over the last 30 days: %s tokens, %s API-equivalent" %
-                                               (fmt_tokens(summary.total_tokens), fmt_cost(summary.total_cost_usd)))))
-    add('<defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="%s"/><stop offset="1" stop-color="%s"/></linearGradient></defs>'
-        % (t.bg_from, t.bg_to))
-    add('<rect width="%d" height="%d" rx="16" fill="url(#bg)"/>' % (WIDTH, HEIGHT))
-    add('<rect x="0.75" y="0.75" width="%s" height="%s" rx="15.5" fill="none" stroke="%s" stroke-width="1.5"/>' % (WIDTH - 1.5, HEIGHT - 1.5, t.border))
 
     # Header: label, updated date, the two headline numbers.
     add(_text(28, 38, "AI USAGE · LAST 30 DAYS", 14, t.muted, weight=700, family=MONO, spacing=3))
@@ -118,34 +164,51 @@ def render(summary: Summary, theme: Theme) -> str:
 
     # Left column: daily tokens, then the split by tool.
     peak = max([d.tokens for d in summary.daily] + [0])
-    add(_text(28, 156, "TOKENS PER DAY", 13, t.muted, weight=700, family=MONO, spacing=2))
+    add(_heading(28, 156, "TOKENS PER DAY", t))
     add(_text(400, 156, "peak " + fmt_tokens(peak), 13, t.muted, anchor="end"))
     out.extend(_chart(summary, t, 28, 236, 372, 64))
     add(_text(28, 258, fmt_day(summary.first_day), 13, t.muted))
     add(_text(400, 258, fmt_day(summary.last_day), 13, t.muted, anchor="end"))
-    add(_text(28, 290, "BY TOOL", 13, t.muted, weight=700, family=MONO, spacing=2))
-    for i, tool in enumerate(summary.tools):
-        y = 314 + i * 22
-        colour = t.tools.get(tool.label, t.tools["default"])
-        add('<circle cx="34" cy="%s" r="5" fill="%s"/>' % (y - 5, colour))
-        add(_text(48, y, _clip(tool.label, 16), 15, t.text))
-        add(_text(300, y, fmt_tokens(tool.tokens), 15, t.text, anchor="end", weight=700))
-        add(_text(400, y, fmt_cost(tool.cost_usd), 15, t.cost, anchor="end"))
-    if not summary.tools:
-        add(_text(28, 314, "No usage in this period", 15, t.muted))
+    add(_heading(28, 290, "BY TOOL", t))
+    out.extend(_tool_rows(summary, t, 28, 400, 300, 314, 22))
 
     # Right column: top models.
-    add(_text(440, 156, "TOP MODELS", 13, t.muted, weight=700, family=MONO, spacing=2))
-    for i, model in enumerate(summary.models):
-        y = 188 + i * 28
-        share = model.tokens / summary.total_tokens if summary.total_tokens else 0
-        add(_text(440, y, _clip(model.label, 28), 15, t.muted if model.label == "other" else t.text))
-        add(_text(722, y, fmt_tokens(model.tokens), 15, t.text, anchor="end", weight=700))
-        add(_text(812, y, fmt_cost(model.cost_usd), 15, t.cost, anchor="end"))
-        add('<rect x="440" y="%s" width="372" height="3" rx="1.5" fill="%s"/>' % (y + 6, t.track))
-        if share > 0:
-            add('<rect x="440" y="%s" width="%s" height="3" rx="1.5" fill="%s"/>' % (y + 6, max(2.0, round(372 * share, 2)), t.models))
-    if not summary.models:
-        add(_text(440, 188, "No usage in this period", 15, t.muted))
+    add(_heading(440, 156, "TOP MODELS", t))
+    out.extend(_model_rows(summary, t, 440, 812, 722, 188, 28, 28))
+    add("</svg>")
+    return "\n".join(out) + "\n"
+
+
+def render_phone(summary: Summary, theme: Theme) -> str:
+    """The phone card: 400 wide, one column, no text under 14. Its height follows the rows."""
+    t = theme
+    left, right = 20, 380
+    tools_y = 346
+    models_head = tools_y + max(len(summary.tools), 1) * 26 + 22
+    models_y = models_head + 32
+    height = models_y + max(len(summary.models), 1) * 32 - 8 + 4
+    out = _open(summary, t, PHONE_WIDTH, height)
+    add = out.append
+
+    add(_text(left, 38, "AI USAGE · LAST 30 DAYS", 14, t.muted, weight=700, family=MONO, spacing=2))
+    add(_text(left, 60, "updated " + fmt_date(summary.updated), 14, t.muted))
+    add(_text(left, 112, fmt_tokens(summary.total_tokens), 40, t.text, weight=800))
+    add(_text(left, 134, "tokens", 14, t.muted))
+    add(_text(200, 112, fmt_cost(summary.total_cost_usd), 40, t.cost, weight=800))
+    add(_text(200, 134, "API-equivalent", 14, t.muted))
+    add('<line x1="%d" y1="150" x2="%d" y2="150" stroke="%s" stroke-width="1"/>' % (left, right, t.border))
+
+    peak = max([d.tokens for d in summary.daily] + [0])
+    add(_heading(left, 178, "TOKENS PER DAY", t, 14))
+    add(_text(right, 178, "peak " + fmt_tokens(peak), 14, t.muted, anchor="end"))
+    out.extend(_chart(summary, t, left, 260, right - left, 66))
+    add(_text(left, 284, fmt_day(summary.first_day), 14, t.muted))
+    add(_text(right, 284, fmt_day(summary.last_day), 14, t.muted, anchor="end"))
+
+    add(_heading(left, 318, "BY TOOL", t, 14))
+    out.extend(_tool_rows(summary, t, left, right, 250, tools_y, 26))
+
+    add(_heading(left, models_head, "TOP MODELS", t, 14))
+    out.extend(_model_rows(summary, t, left, right, 290, models_y, 32, 26))
     add("</svg>")
     return "\n".join(out) + "\n"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -13,7 +14,7 @@ from ai_usage_card import cli, publish
 from ai_usage_card.load import CacheError, load_records
 from ai_usage_card.pricing import load_rates, price
 from ai_usage_card.privacy import PrivacyError, check_privacy
-from ai_usage_card.render import DARK, LIGHT, fmt_cost, fmt_tokens, render
+from ai_usage_card.render import DARK, LIGHT, fmt_cost, fmt_tokens, render, render_phone
 from ai_usage_card.summarise import summarise
 from tests import fixtures as fx
 
@@ -197,12 +198,38 @@ class RenderTests(Case):
                 self.assertIn(text, svg)
         self.assertNotEqual(render(self.summary(), LIGHT), render(self.summary(), DARK))
 
+    def test_the_phone_card_is_valid_svg_400_wide_with_the_same_numbers(self):
+        for theme in (LIGHT, DARK):
+            svg = render_phone(self.summary(), theme)
+            root = ET.fromstring(svg)
+            self.assertEqual(root.get("width"), "400")
+            self.assertEqual(root.get("viewBox").split()[:3], ["0", "0", "400"])
+            for text in ("API-equivalent", "updated 18 Oct 2026", "27.2K", "$0.55", "claude-opus-5-5", "Claude Code", "TOP MODELS", "BY TOOL"):
+                self.assertIn(text, svg)
+        self.assertNotEqual(render_phone(self.summary(), LIGHT), render_phone(self.summary(), DARK))
+
+    def test_phone_text_is_never_smaller_than_14_so_it_stays_about_11px_at_330_wide(self):
+        for theme in (LIGHT, DARK):
+            sizes = [int(size) for size in re.findall(r'font-size="(\d+)"', render_phone(self.summary(), theme))]
+            self.assertGreaterEqual(min(sizes), 14)
+
+    def test_the_phone_card_grows_with_its_rows_and_keeps_them_inside(self):
+        full = ET.fromstring(render_phone(self.summary(), DARK))
+        empty = ET.fromstring(render_phone(summarise([], load_rates(self.userdata), TODAY), DARK))
+        height = lambda root: float(root.get("viewBox").split()[3])
+        self.assertGreater(height(full), height(empty))
+        for root in (full, empty):
+            ys = [float(node.get("y")) for node in root.iter("{http://www.w3.org/2000/svg}text")]
+            self.assertLess(max(ys), height(root))
+
     def test_a_real_zero_is_drawn_as_zero(self):
         empty = summarise([], load_rates(self.userdata), TODAY)
-        svg = render(empty, DARK)
-        ET.fromstring(svg)
-        self.assertIn(">0<", svg)
-        self.assertIn(">$0<", svg)
+        for draw in (render, render_phone):
+            svg = draw(empty, DARK)
+            ET.fromstring(svg)
+            self.assertIn(">0<", svg)
+            self.assertIn(">$0<", svg)
+            self.assertIn("No usage in this period", svg)
 
     def test_number_formats(self):
         self.assertEqual([fmt_tokens(n) for n in (0, 999, 1234, 12345678, 123456789, 999960, 1_234_567_890)],
@@ -215,6 +242,7 @@ class RenderTests(Case):
             with self.assertRaises(PrivacyError, msg=bad):
                 check_privacy("<svg>%s</svg>" % bad)
         check_privacy(render(self.summary(), DARK))
+        check_privacy(render_phone(self.summary(), DARK))
 
     def test_a_model_named_like_an_id_is_shown_as_other(self):
         scan = fx.scan_cache()
@@ -223,7 +251,9 @@ class RenderTests(Case):
         fx.write_userdata(self.userdata, scan=scan)
         for theme in (LIGHT, DARK):
             check_privacy(render(self.summary(), theme))
+            check_privacy(render_phone(self.summary(), theme))
         self.assertNotIn("123e4567", render(self.summary(), DARK))
+        self.assertNotIn("123e4567", render_phone(self.summary(), DARK))
 
 
 class CliTests(Case):
@@ -231,9 +261,11 @@ class CliTests(Case):
         args = ["--userdata", str(self.userdata), "--log", str(self.tmp / "card.log")] + list(extra)
         return cli.main(args, now=now)
 
-    def test_writes_both_files_to_out(self):
+    FOUR = ["ai-usage-dark.svg", "ai-usage-light.svg", "ai-usage-phone-dark.svg", "ai-usage-phone-light.svg"]
+
+    def test_writes_all_four_files_to_out(self):
         self.assertEqual(self.run_cli("--out", str(self.tmp / "out")), 0)
-        self.assertEqual(sorted(p.name for p in (self.tmp / "out").iterdir()), ["ai-usage-dark.svg", "ai-usage-light.svg"])
+        self.assertEqual(sorted(p.name for p in (self.tmp / "out").iterdir()), self.FOUR)
 
     def test_refuses_when_the_newest_record_is_older_than_48_hours(self):
         out = self.tmp / "out"
@@ -262,12 +294,19 @@ class CliTests(Case):
         # with only a future record, the age check still refuses
         self.assertEqual(self.run_cli("--out", str(out), now=fx.NOW + timedelta(hours=49)), 1)
 
-    def test_refuses_when_the_privacy_guard_trips(self):
-        out = self.tmp / "out"
-        with mock.patch.object(cli, "render", return_value="<svg>/Users/someone</svg>"):
-            self.assertEqual(self.run_cli("--out", str(out)), 1)
-        self.assertFalse(out.exists())
+    def test_refuses_when_the_privacy_guard_trips_on_any_of_the_four(self):
+        for name in ("render", "render_phone"):
+            out = self.tmp / ("out-" + name)
+            with mock.patch.object(cli, name, return_value="<svg>/Users/someone</svg>"):
+                self.assertEqual(self.run_cli("--out", str(out)), 1)
+            self.assertFalse(out.exists())
         self.assertIn("PrivacyError", (self.tmp / "card.log").read_text())
+
+    def test_the_guard_runs_over_the_phone_files_only_too(self):
+        real_phone = cli.render_phone
+        with mock.patch.object(cli, "render_phone", side_effect=lambda s, t: real_phone(s, t).replace("</svg>", "msg_01ABC</svg>")):
+            self.assertEqual(self.run_cli("--out", str(self.tmp / "out")), 1)
+        self.assertFalse((self.tmp / "out").exists())
 
     def test_refuses_an_unsupported_cache_version(self):
         scan = fx.scan_cache()
@@ -290,7 +329,7 @@ class CliTests(Case):
             self.assertEqual(self.run_cli(*publish_args), 0)
             self.assertEqual(self.run_cli(*publish_args), 0)  # no new data: no new commit
             self.assertEqual(git("rev-list", "--count", "usage-card"), "1")
-            self.assertEqual(git("ls-tree", "--name-only", "usage-card").split("\n"), ["ai-usage-dark.svg", "ai-usage-light.svg"])
+            self.assertEqual(git("ls-tree", "--name-only", "usage-card").split("\n"), self.FOUR)
             self.assertEqual(git("log", "-1", "--format=%s", "usage-card"), "Update AI usage card")
             self.assertEqual(git("rev-list", "--max-parents=0", "usage-card"), git("rev-parse", "usage-card"))  # the commit is the orphan root
             # a new record changes the card: exactly one more commit

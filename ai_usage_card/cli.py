@@ -16,7 +16,7 @@ from . import publish as publisher
 from .load import CacheError, load_records
 from .pricing import load_rates
 from .privacy import PrivacyError, check_privacy
-from .render import DARK, LIGHT, fmt_cost, fmt_tokens, render
+from .render import DARK, LIGHT, fmt_cost, fmt_tokens, render, render_phone
 from .summarise import TIMEZONE, local_day, summarise, window_start_ms
 
 HOME = Path.home()
@@ -36,7 +36,7 @@ class Refused(Exception):
 
 
 def build_cards(userdata: Path, now: datetime) -> Dict[str, str]:
-    """The two SVGs, or Refused / CacheError / PrivacyError. Pure of side effects except reading.
+    """The four SVGs (wide and phone, light and dark), or Refused / CacheError / PrivacyError. Pure of side effects except reading.
 
     The window ends on the day of the newest record, not on today: T3 Code saves its usage cache
     only when its usage page is open, so days after the newest record were never loaded and must
@@ -54,7 +54,8 @@ def build_cards(userdata: Path, now: datetime) -> Dict[str, str]:
         raise Refused("newest record is %.0f hours old (limit %d): T3 Code's usage cache has not been refreshed"
                       " (open its usage page)" % ((now_ms - newest_ms) / 3.6e6, MAX_RECORD_AGE.total_seconds() / 3600))
     summary = summarise(records, load_rates(userdata), local_day(newest_ms), newest_ms)
-    cards = {"ai-usage-light.svg": render(summary, LIGHT), "ai-usage-dark.svg": render(summary, DARK)}
+    cards = {"ai-usage-light.svg": render(summary, LIGHT), "ai-usage-dark.svg": render(summary, DARK),
+             "ai-usage-phone-light.svg": render_phone(summary, LIGHT), "ai-usage-phone-dark.svg": render_phone(summary, DARK)}
     for svg in cards.values():
         check_privacy(svg)
     log.info("30 days: %s tokens, %s API-equivalent, updated %s", fmt_tokens(summary.total_tokens),

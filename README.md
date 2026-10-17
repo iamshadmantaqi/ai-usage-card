@@ -1,12 +1,12 @@
 # ai-usage-card
 
-A self-updating SVG card of my AI usage over the last 30 days, shown on my [GitHub profile](https://github.com/iamshadmantaqi). It shows total tokens, the API-equivalent cost, a daily bar chart, the split by tool (Claude Code, Codex, Grok, Cursor and any other tool present) and the top six models. There is a light and a dark version.
+A self-updating SVG card of my AI usage over the last 30 days, shown on my [GitHub profile](https://github.com/iamshadmantaqi). It shows total tokens, the API-equivalent cost, a daily bar chart, the split by tool (Claude Code, Codex, Grok, Cursor and any other tool present) and the top six models. There is a light and a dark version, each in a wide layout (840 px) and a narrow phone layout (400 px, one column, text large enough to read on a 360 px screen).
 
 ## How it works
 
 1. It reads T3 Code's local usage cache (`~/.t3/userdata/usage-scan-cache-v5.json`, plus its Cursor and rate-table caches). T3 Code already scans every tool's transcripts, so there is no parser per tool here. T3 Code saves that cache when its usage page is open, so the card is as fresh as the last visit to that page; the 30 days end on the day of the newest record.
 2. It de-duplicates records and prices them the way T3 Code does, so the card matches T3 Code's own usage view. The record layouts are documented in `ai_usage_card/load.py`.
-3. It draws `ai-usage-light.svg` and `ai-usage-dark.svg` and commits them to the `usage-card` branch of the profile repo, only when the bytes changed.
+3. It draws `ai-usage-light.svg`, `ai-usage-dark.svg`, `ai-usage-phone-light.svg` and `ai-usage-phone-dark.svg` and commits all four in one commit to the `usage-card` branch of the profile repo, only when the bytes of any changed.
 4. A launchd job on my Mac runs this daily at 06:00. It costs no AI tokens.
 
 ## Costs are API-equivalent
@@ -25,7 +25,7 @@ cd ai-usage-card
 
 `install.sh` copies the code to `~/Library/Application Support/ai-usage-card/app`, installs `~/Library/LaunchAgents/com.iamshadmantaqi.ai-usage-card.plist` and, with `--kickstart`, runs the job once through launchd. Log: `~/Library/Logs/ai-usage-card.log`. Run `./install.sh` again after pulling a change.
 
-To try it without publishing: `python3 -m ai_usage_card --out /tmp/card` writes the two SVGs there.
+To try it without publishing: `python3 -m ai_usage_card --out /tmp/card` writes the four SVGs there.
 
 ## It refuses to publish when
 
@@ -37,7 +37,7 @@ A refusal exits non-zero, logs the reason and commits nothing.
 
 ## Privacy guard
 
-Only model names, tool names, dates and numbers reach the SVG. The renderer takes a typed `Summary` that holds nothing else, so session ids, message ids, paths, project names and chat titles never get that far. Model and tool names must also be plain names: anything with other characters, or that looks like an id, is shown as "other". Before anything is written, the output is checked for `/Users/`, `/Volumes/`, `/private/`, `/home/`, `msg_`, `req_`, a UUID, a long hex id and `~`, and the run stops if any is found.
+Only model names, tool names, dates and numbers reach the SVG. The renderer takes a typed `Summary` that holds nothing else, so session ids, message ids, paths, project names and chat titles never get that far. Model and tool names must also be plain names: anything with other characters, or that looks like an id, is shown as "other". Before anything is written, each of the four files is checked for `/Users/`, `/Volumes/`, `/private/`, `/home/`, `msg_`, `req_`, a UUID, a long hex id and `~`, and the run stops if any is found.
 
 ## Tests
 
