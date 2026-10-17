@@ -1,7 +1,7 @@
 """Draw the card as SVG, light and dark, from a `Summary` and nothing else.
 
 Colours come from the profile's `assets/banner.svg` (dark navy panel, amber, coral, violet,
-teal and green accents). `check_privacy` refuses any output that could carry a path or an id.
+teal and green accents). The caller runs `privacy.check_privacy` on the output.
 """
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from datetime import date
 from typing import List
 from xml.sax.saxutils import escape
 
-from .privacy import PrivacyError, check_privacy  # noqa: F401  (re-exported)
 from .summarise import Summary
 
 WIDTH, HEIGHT = 840, 392
@@ -54,7 +53,7 @@ def fmt_tokens(tokens: int) -> str:
 def fmt_cost(cost: float) -> str:
     if cost <= 0:
         return "$0"
-    if cost < 100:
+    if round(cost, 2) < 100:  # 99.996 must not print as $100.00
         return "$%.2f" % cost
     return "${:,}".format(int(round(cost)))
 

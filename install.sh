@@ -23,6 +23,11 @@ sed -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@LOG_FILE@|$LOG_FILE|g" \
 plutil -lint "$PLIST" >/dev/null
 
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+# bootout returns before the job is gone, and bootstrapping the same label too soon fails.
+for _ in $(seq 1 50); do
+  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break
+  sleep 0.1
+done
 launchctl bootstrap "$DOMAIN" "$PLIST"
 echo "Installed $LABEL (daily at 06:00). Log: $LOG_FILE"
 

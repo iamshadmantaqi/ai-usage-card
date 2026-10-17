@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import re
 
-# A home path, a message or request id, a UUID, a tilde path.
+# A home or volume path, a message or request id, a UUID, a long hex id, a tilde path.
 FORBIDDEN = (
     re.compile(r"/Users/"),
+    re.compile(r"/Volumes/"),
+    re.compile(r"/private/"),
+    re.compile(r"/home/"),
+    re.compile(r"[0-9a-fA-F]{20,}"),
     re.compile(r"msg_"),
     re.compile(r"req_"),
     re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"),
