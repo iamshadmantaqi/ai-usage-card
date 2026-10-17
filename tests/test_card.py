@@ -11,8 +11,9 @@ from pathlib import Path
 from unittest import mock
 
 from ai_usage_card import cli, publish
+from ai_usage_card.claude import _timestamp_ms, load_claude_records, transcript_files
 from ai_usage_card.load import CacheError, load_records
-from ai_usage_card.pricing import load_rates, price
+from ai_usage_card.pricing import load_rates, parse_rate_table, price
 from ai_usage_card.privacy import PrivacyError, check_privacy
 from ai_usage_card.render import DARK, LIGHT, fmt_cost, fmt_tokens, render, render_phone
 from ai_usage_card.summarise import summarise
@@ -27,6 +28,7 @@ class Case(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         self.userdata = fx.write_userdata(self.tmp / "userdata")
+        self.projects = fx.write_projects(self.tmp / "projects")
 
     def summary(self):
         return summarise(load_records(self.userdata), load_rates(self.userdata), TODAY)
@@ -106,7 +108,133 @@ class LoadTests(Case):
         self.assertNotIn("default", labels)
 
 
+class ClaudeTranscriptTests(Case):
+    def claude(self, min_file_mtime_ms=fx.ms(9, 1, 0)):
+        return load_claude_records([self.projects], min_file_mtime_ms)
+
+    def test_a_reply_written_three_times_counts_once_with_its_final_output(self):
+        x = [r for r in self.claude() if r.tokens.output == 3000]
+        self.assertEqual(len(x), 1)
+        self.assertEqual(len([r for r in self.claude() if r.model == "claude-opus-5-5" and r.speed == "standard"]), 1)
+        self.assertEqual(x[0].tokens.total, 5100)  # not 1110 (first copy) or 1200 (second)
+
+    def test_subagent_files_count_and_a_symlinked_project_folder_does_not_double_count(self):
+        records = self.claude()
+        self.assertEqual(sorted(r.tokens.total for r in records), [170, 300, 5100])  # X, Y (subagent), F; synthetic, user and broken lines out
+
+    def test_each_transcript_is_read_once_through_a_symlinked_folder_or_root(self):
+        names = lambda *roots: sorted(os.path.relpath(p, os.path.realpath(str(self.projects))) for p in transcript_files(roots))
+        expected = ["-proj-a/chat1.jsonl", "-proj-a/chat1/subagents/agent-1.jsonl", "-proj-a/chat2.jsonl", "-proj-old/old.jsonl"]
+        self.assertEqual(names(self.projects), expected)
+        os.symlink(str(self.projects), str(self.tmp / "alt"))  # like ~/.claude-alt/projects
+        self.assertEqual(names(self.tmp / "alt"), expected)
+        self.assertEqual(names(self.projects, self.tmp / "alt", self.tmp / "missing"), expected)  # T3 lists both
+
+    def test_a_symlinked_transcript_file_and_a_symlink_cycle_are_read_once(self):
+        os.symlink(str(self.projects / "-proj-a" / "chat2.jsonl"), str(self.projects / "-proj-old" / "linked.jsonl"))
+        os.symlink(str(self.projects), str(self.projects / "-proj-a" / "loop"))
+        os.symlink(str(self.tmp / "gone.jsonl"), str(self.projects / "-proj-old" / "broken.jsonl"))
+        paths = list(transcript_files([self.projects]))
+        self.assertEqual(len(paths), 4)
+        self.assertEqual(len(set(paths)), 4)
+
+    def test_a_missing_or_unreadable_transcripts_folder_or_file_is_refused(self):
+        with self.assertRaisesRegex(CacheError, "no Claude Code transcripts folder"):
+            load_claude_records([self.tmp / "missing"])
+        for target in (self.projects / "-proj-a" / "chat1" / "subagents", self.projects / "-proj-a" / "chat2.jsonl"):
+            os.chmod(str(target), 0)
+            self.addCleanup(os.chmod, str(target), 0o755)
+            with self.assertRaisesRegex(CacheError, "cannot be read \\(PermissionError\\)"):
+                self.claude()
+            os.chmod(str(target), 0o755)
+
+    def test_a_copy_without_a_request_id_is_still_the_same_reply(self):
+        fx.write_lines(self.projects / "-proj-b" / "fork.jsonl", [
+            fx.reply("claude-opus-5-5", (10, 17, 6), fx.usage(100, 3000, read=1000, five=400, hour=600), req=None)])
+        self.assertEqual(sorted(r.tokens.total for r in self.claude()), [170, 300, 5100])
+
+    def test_empty_ids_do_not_merge_different_replies(self):
+        fx.write_lines(self.projects / "-proj-b" / "odd.jsonl", [
+            fx.reply("claude-opus-5-5", (10, 17, 8), fx.usage(1, 1), msg="", req="req_p"),
+            fx.reply("claude-opus-5-5", (10, 17, 8), fx.usage(2, 2), msg="", req="req_q"),
+            fx.reply("claude-opus-5-5", (10, 17, 8), fx.usage(3, 3), msg="", req="")])
+        self.assertEqual(sorted(r.tokens.total for r in self.claude()), [2, 4, 6, 170, 300, 5100])
+
+    def test_claude_code_timestamps_are_read_with_any_fraction_length(self):
+        self.assertEqual(_timestamp_ms("2026-10-17T06:00:00.123Z"), 1792216800123)
+        self.assertEqual(_timestamp_ms("2026-10-17T06:00:00.123456Z"), 1792216800123)
+        self.assertEqual(_timestamp_ms("2026-10-17T06:00:00.1234567Z"), 1792216800123)
+        self.assertEqual(_timestamp_ms("2026-10-17T06:00:00.1Z"), 1792216800100)
+        self.assertEqual(_timestamp_ms("2026-10-17T12:00:00+06:00"), 1792216800000)
+        self.assertEqual(_timestamp_ms("2026-10-17T06:00:00"), 1792216800000)  # no zone is UTC
+        for bad in ("2026-13-17T06:00:00Z", "yesterday", 1792216800123, None):
+            self.assertIsNone(_timestamp_ms(bad))
+
+    def test_files_last_written_before_the_window_are_skipped(self):
+        self.assertEqual(len(self.claude()), 3)
+        (self.projects / "-proj-old" / "old.jsonl").write_text(
+            fx.reply("claude-opus-5-5", (8, 1, 5), fx.usage(1, 1), msg="msg_o", req="req_o") + "\n")
+        self.assertEqual(len(self.claude(fx.ms(7, 1, 0))), 4)  # a fresh mtime brings it back
+
+    def test_one_hour_writes_cost_more_than_five_minute_writes(self):
+        rates = load_rates(self.userdata)
+        by_total = {r.tokens.total: r for r in self.claude()}
+        self.assertEqual(by_total[5100].tokens.cache_creation_1h, 600)
+        self.assertAlmostEqual(price(rates, by_total[5100]), 0.0169, places=9)  # 600 at 2e-6; at 1.25e-6 it would be 0.01645
+        self.assertAlmostEqual(price(rates, by_total[170]), 0.00055, places=9)  # unsplit writes are 5-minute
+        self.assertAlmostEqual(price(rates, by_total[300]), 0.0022, places=9)  # fast mode doubles it
+
+    def test_a_model_without_a_one_hour_rate_prices_those_writes_at_the_five_minute_rate(self):
+        table = fx.rates()
+        del table["document"]["claude-opus-5-5"]["cache_creation_input_token_cost_above_1hr"]
+        fx.write_userdata(self.userdata, rate_table=table)
+        record = next(r for r in self.claude() if r.tokens.total == 5100)
+        self.assertAlmostEqual(price(load_rates(self.userdata), record), 0.01645, places=9)
+
+    def test_nothing_from_a_transcript_but_numbers_a_model_and_a_time_reaches_the_records(self):
+        for record in self.claude():
+            self.assertEqual((record.provider, record.session_id, record.dedupe_key, record.reported_cost_usd), ("claude", "", None, None))
+            self.assertNotIn("private", repr(record))
+            self.assertNotIn("secret", repr(record))
+
+    def test_the_claude_folders_t3_scans_are_read_too_without_double_counting(self):
+        other = self.tmp / "other-account" / "projects"
+        fx.write_lines(other / "-proj-z" / "chat.jsonl", [fx.reply("claude-opus-5-5", (10, 17, 9), fx.usage(30, 70), msg="msg_z", req="req_z")])
+        scan = fx.scan_cache()
+        scan["sources"] = {"claude\0" + str(self.tmp / "alt"): {"dir": str(self.projects)},
+                           "claude\0" + str(other): {"dir": str(other)},
+                           "codex\0" + str(self.tmp / "codex"): {"dir": str(self.tmp / "codex")}}
+        fx.write_userdata(self.userdata, scan=scan)
+        records, _ = cli.gather(self.userdata, self.projects, fx.NOW)
+        self.assertEqual(sorted(r.tokens.total for r in records if r.provider == "claude"), [100, 170, 300, 5100])
+
+    def test_refuses_when_t3_has_claude_usage_but_the_transcripts_give_none(self):
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        with self.assertRaisesRegex(cli.Refused, "transcripts gave none"):
+            cli.gather(self.userdata, empty, fx.NOW)
+
+    def test_t3s_claude_records_are_ignored_but_its_other_tools_still_count(self):
+        records, t3_newest = cli.gather(self.userdata, self.projects, fx.NOW)
+        s = summarise(records, load_rates(self.userdata), TODAY)
+        self.assertEqual([(t.label, t.tokens) for t in s.tools],
+                         [("Claude Code", 5570), ("Cursor", 3500), ("Grok", 2006), ("Codex", 350)])
+        self.assertEqual(s.total_tokens, 5570 + 3500 + 2006 + 350)
+        # 0.0169 + 0.00055 + 0.0022 (claude) + 0.0123 (cursor, reported) + 0.000055 (codex) + 0 (grok, unpriced)
+        self.assertAlmostEqual(s.total_cost_usd, 0.032005, places=6)
+        self.assertEqual(t3_newest, fx.ms(10, 18, 3))  # the Cursor row, T3's newest
+
+
 class PricingTests(Case):
+    def test_a_priority_tier_without_a_one_hour_rate_keeps_the_standard_ratio(self):
+        table = parse_rate_table({"m": {"input_cost_per_token": 1e-6, "output_cost_per_token": 5e-6,
+                                        "cache_creation_input_token_cost": 1.25e-6, "cache_creation_input_token_cost_above_1hr": 2e-6,
+                                        "input_cost_per_token_priority": 2e-6, "output_cost_per_token_priority": 1e-5}})
+        self.assertAlmostEqual(table["m"].fast.cache_creation, 2.5e-6, places=15)
+        self.assertAlmostEqual(table["m"].fast.cache_creation_1h, 4e-6, places=15)  # not 2.5e-6, the 5-minute rate
+        self.assertAlmostEqual(table["m"].standard.cache_creation_1h, 2e-6, places=15)
+
+
     def price_of(self, model):
         rates = load_rates(self.userdata)
         record = next(r for r in load_records(self.userdata) if r.model == model)
@@ -270,7 +398,7 @@ class RenderTests(Case):
 
 class CliTests(Case):
     def run_cli(self, *extra, now=fx.NOW):
-        args = ["--userdata", str(self.userdata), "--log", str(self.tmp / "card.log")] + list(extra)
+        args = ["--userdata", str(self.userdata), "--claude-projects", str(self.projects), "--log", str(self.tmp / "card.log")] + list(extra)
         return cli.main(args, now=now)
 
     FOUR = ["ai-usage-dark.svg", "ai-usage-light.svg", "ai-usage-phone-dark.svg", "ai-usage-phone-light.svg"]
@@ -283,20 +411,29 @@ class CliTests(Case):
         out = self.tmp / "out"
         self.assertEqual(self.run_cli("--out", str(out), now=fx.NOW + timedelta(hours=49)), 1)
         self.assertFalse(out.exists())
-        self.assertIn("usage cache has not been refreshed", (self.tmp / "card.log").read_text())
+        self.assertIn("no source has recent usage", (self.tmp / "card.log").read_text())
 
-    def test_the_window_ends_on_the_newest_record_day_not_today(self):
+    def test_the_window_ends_today_even_when_the_newest_record_is_older(self):
         out = self.tmp / "out"
-        # 40 hours later it is 19 Oct, but the newest record is from 18 Oct: 19 Oct was never loaded.
+        # 40 hours later it is 19 Oct: Claude Code's transcripts are live, so 19 Oct is drawn (as zero), not dropped.
         self.assertEqual(self.run_cli("--out", str(out), now=fx.NOW + timedelta(hours=40)), 0)
         svg = (out / "ai-usage-dark.svg").read_text()
         self.assertIn("updated 18 Oct 2026", svg)
-        self.assertIn(">18 Oct<", svg)
-        self.assertNotIn("19 Oct", svg)
+        self.assertIn(">19 Oct<", svg)
+
+    def test_a_stale_t3_cache_alone_warns_but_does_not_refuse(self):
+        # T3's newest record is 18 Oct 03:00 Dhaka, 53 hours before now; Claude Code has a reply an hour before now.
+        now = fx.NOW + timedelta(hours=52)
+        fx.write_lines(self.projects / "-proj-a" / "chat3.jsonl",
+                       [fx.reply("claude-opus-5-5", (10, 20, 1), fx.usage(10, 10), msg="msg_n", req="req_n")], mtime_ms=fx.ms(10, 20, 4))
+        out = self.tmp / "out"
+        self.assertEqual(self.run_cli("--out", str(out), now=now), 0)
+        self.assertEqual(len(list(out.iterdir())), 4)
+        self.assertIn("WARNING T3 Code's newest record is 53 hours old", (self.tmp / "card.log").read_text())
 
     def test_future_and_out_of_range_timestamps_are_ignored(self):
         scan = fx.scan_cache()
-        scan["files"]["/f/z.jsonl"] = fx.entry("claude", [
+        scan["files"]["/f/z.jsonl"] = fx.entry("grok", [
             fx.row(10 ** 15, "claude-sonnet-5-5", 0, 1, 0, 0, 0, "msg_huge:req_huge"),
             fx.row(fx.ms(10, 25, 1), "claude-sonnet-5-5", 0, 1, 0, 0, 0, "msg_future:req_future")])
         fx.write_userdata(self.userdata, scan=scan)
@@ -305,6 +442,18 @@ class CliTests(Case):
         self.assertIn("updated 18 Oct 2026", (out / "ai-usage-dark.svg").read_text())
         # with only a future record, the age check still refuses
         self.assertEqual(self.run_cli("--out", str(out), now=fx.NOW + timedelta(hours=49)), 1)
+
+    def test_a_future_dated_transcript_line_does_not_hide_a_stale_card(self):
+        fx.write_lines(self.projects / "-proj-a" / "chat4.jsonl",
+                       [fx.reply("claude-opus-5-5", (1, 1, 1, 2030), fx.usage(10, 10), msg="msg_2030", req="req_2030")], mtime_ms=fx.ms(10, 18, 3))
+        self.assertEqual(self.run_cli("--out", str(self.tmp / "out"), now=fx.NOW + timedelta(hours=49)), 1)
+        self.assertIn("no source has recent usage", (self.tmp / "card.log").read_text())
+
+    def test_a_missing_transcripts_folder_publishes_nothing(self):
+        out = self.tmp / "out"
+        self.assertEqual(self.run_cli("--out", str(out), "--claude-projects", str(self.tmp / "missing")), 1)
+        self.assertFalse(out.exists())
+        self.assertIn("no Claude Code transcripts folder found", (self.tmp / "card.log").read_text())
 
     def test_refuses_when_the_privacy_guard_trips_on_any_of_the_four(self):
         for name in ("render", "render_phone"):
@@ -340,7 +489,7 @@ class CliTests(Case):
             self.assertEqual(git("rev-list", "--max-parents=0", "usage-card"), git("rev-parse", "usage-card"))  # the commit is the orphan root
             # a new record changes the card: exactly one more commit
             scan = fx.scan_cache()
-            scan["files"]["/f/f.jsonl"] = fx.entry("claude", [fx.row(fx.ms(10, 18, 3), "claude-sonnet-5-5", 0, 1, 0, 0, 1, "msg_z:req_z")])
+            scan["files"]["/f/f.jsonl"] = fx.entry("grok", [fx.row(fx.ms(10, 18, 3), "claude-sonnet-5-5", 0, 1, 0, 0, 1, "msg_z:req_z")])
             fx.write_userdata(self.userdata, scan=scan)
             self.assertEqual(self.run_cli(*publish_args), 0)
             self.assertEqual(git("rev-list", "--count", "usage-card"), "2")
@@ -401,7 +550,7 @@ class CliTests(Case):
             self.assertEqual(self.run_cli(*publish_args), 0)
             other_clone_pushes(orphan=True)  # the branch no longer shares history with the working clone
             self.assertEqual(self.run_cli(*publish_args), 0)
-            cards = cli.build_cards(self.userdata, fx.NOW)
+            cards = cli.build_cards(self.userdata, fx.NOW, self.projects)
             for name in self.FOUR:
                 self.assertEqual(tip_file(name), cards[name])
 
@@ -419,13 +568,13 @@ class CliTests(Case):
         with mock.patch.dict(os.environ, env):
             self.assertEqual(self.run_cli(*publish_args), 0)
             scan = fx.scan_cache()
-            scan["files"]["/f/f.jsonl"] = fx.entry("claude", [fx.row(fx.ms(10, 18, 3), "claude-sonnet-5-5", 0, 1, 0, 0, 1, "msg_z:req_z")])
+            scan["files"]["/f/f.jsonl"] = fx.entry("grok", [fx.row(fx.ms(10, 18, 3), "claude-sonnet-5-5", 0, 1, 0, 0, 1, "msg_z:req_z")])
             fx.write_userdata(self.userdata, scan=scan)
             with mock.patch.object(Path, "write_text", third_write_fails):
                 self.assertEqual(self.run_cli(*publish_args), 1)  # two of the four files written, nothing committed
             other_clone_pushes(orphan=False)  # meanwhile the remote moves on and touches a half-written file
             self.assertEqual(self.run_cli(*publish_args), 0)
-            cards = cli.build_cards(self.userdata, fx.NOW)  # the new data, all four files
+            cards = cli.build_cards(self.userdata, fx.NOW, self.projects)  # the new data, all four files
             for name in self.FOUR:
                 self.assertEqual(tip_file(name), cards[name])
 

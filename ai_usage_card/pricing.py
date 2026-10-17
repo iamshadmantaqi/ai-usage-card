@@ -1,4 +1,6 @@
-"""API-equivalent pricing, mirroring T3 Code's `usagePricing.ts` so the card matches its usage view.
+"""API-equivalent pricing, mirroring T3 Code's `usagePricing.ts` so the card matches its usage view,
+with one deliberate difference: 1-hour cache writes (known only from Claude Code's transcripts) are
+priced at LiteLLM's `cache_creation_input_token_cost_above_1hr`, where T3 charges the 5-minute rate.
 
 Rates come from T3's cached LiteLLM table (`usage-model-rates.json`, `{fetchedAtMs, document}`).
 Cost is list price at the API, not what was paid.
@@ -23,6 +25,7 @@ class TokenRates:
     output: float
     cache_read: float
     cache_creation: float
+    cache_creation_1h: float  # LiteLLM's `cache_creation_input_token_cost_above_1hr`, else see _read_rates
 
 
 @dataclass(frozen=True)
@@ -51,13 +54,22 @@ def _read_rates(entry: Dict[str, Any], suffix: str, standard: Optional[TokenRate
             return getattr(standard, field) / standard.input * inp
         return float(inp)
 
-    return TokenRates(float(inp), float(out), cache("cache_read_input_token_cost", "cache_read"),
-                      cache("cache_creation_input_token_cost", "cache_creation"))
+    creation = cache("cache_creation_input_token_cost", "cache_creation")
+    # A missing 1-hour rate takes the standard tier's 1-hour-to-input ratio, as the other cache rates
+    # do; only the standard tier itself falls back to its 5-minute rate.
+    one_hour = entry.get("cache_creation_input_token_cost_above_1hr" + suffix)
+    if _num(one_hour):
+        one_hour = float(one_hour)
+    elif standard is not None and standard.input > 0:
+        one_hour = standard.cache_creation_1h / standard.input * inp
+    else:
+        one_hour = creation
+    return TokenRates(float(inp), float(out), cache("cache_read_input_token_cost", "cache_read"), creation, one_hour)
 
 
 def _scale(rates: TokenRates, multiple: float) -> TokenRates:
     return TokenRates(rates.input * multiple, rates.output * multiple, rates.cache_read * multiple,
-                      rates.cache_creation * multiple)
+                      rates.cache_creation * multiple, rates.cache_creation_1h * multiple)
 
 
 def _fast_multiplier(entry: Dict[str, Any]) -> Optional[float]:
@@ -132,7 +144,9 @@ def price(table: Dict[str, ModelRates], record: UsageRecord) -> float:
         return reported if reported is not None else 0.0
     r = rate.at(record.speed)
     t = record.tokens
-    list_cost = t.uncached * r.input + t.cached * r.cache_read + t.cache_creation * r.cache_creation + t.output * r.output
+    one_hour = min(t.cache_creation_1h, t.cache_creation)
+    list_cost = (t.uncached * r.input + t.cached * r.cache_read + (t.cache_creation - one_hour) * r.cache_creation
+                 + one_hour * r.cache_creation_1h + t.output * r.output)
     if reported is not None and list_cost <= 0:
         return reported
     return reported if reported is not None else list_cost
