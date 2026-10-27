@@ -484,6 +484,14 @@ class CliTests(Case):
             self.assertFalse(out.exists())
         self.assertIn("PrivacyError", (self.tmp / "card.log").read_text())
 
+    def test_a_blocked_transcripts_folder_refuses_and_names_the_macos_privacy_setting(self):
+        denied = PermissionError(1, "Operation not permitted")
+        with mock.patch("ai_usage_card.claude.os.walk", side_effect=lambda root, onerror, **kw: onerror(denied)):
+            self.assertEqual(self.run_cli("--out", str(self.tmp / "out")), 1)
+        log = (self.tmp / "card.log").read_text()
+        self.assertIn("cannot be read (PermissionError): macOS may be blocking this job from the drive", log)
+        self.assertFalse((self.tmp / "out").exists())
+
     def test_refuses_an_unsupported_cache_version(self):
         scan = fx.scan_cache()
         scan["version"] = 10
