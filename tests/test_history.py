@@ -14,7 +14,7 @@ from ai_usage_card import cli, history
 from ai_usage_card.history import Ledger, LedgerError, Row
 from ai_usage_card.load import Tokens, UsageRecord
 from ai_usage_card.render import DARK, LIGHT, render, render_phone
-from ai_usage_card.summarise import TIMEZONE, cut_off_day, freeze, summarise
+from ai_usage_card.summarise import TIMEZONE, freeze, summarise
 from tests import fixtures as fx
 
 TODAY = date(2026, 10, 28)  # a Wednesday; today - 30 days is Mon 28 Sep, today - 29 days is Tue 29 Sep
@@ -110,43 +110,26 @@ class FreezeTests(Base):
         self.assertEqual(frozen.days[date(2026, 9, 1)], [row("cursor", "cursor-auto", 3, 0.5)])
 
 
-class PartialFirstDayTests(Base):
+class FirstDayTests(Base):
     # The cleanup point for TODAY is 30 Aug (today - 59 days): these first days all fall after it.
-    def test_the_oldest_day_is_skipped_when_its_first_record_is_at_or_after_0200(self):
+    def test_a_first_day_after_the_cleanup_point_is_kept_whatever_hour_it_starts(self):
+        # No file with a record on 1 Sep can have been deleted yet, so 1 Sep's afternoon is real use, not a cut-off day.
         records = [rec(at(9, 1, 15), 999, 9.0), rec(at(9, 2, 9), 20, 0.2), rec(at(9, 5, 9), 30, 0.3)]
-        self.assertEqual(cut_off_day(records, Ledger.empty(), TODAY), date(2026, 9, 1))
         frozen = freeze(records, {}, TODAY, Ledger.empty(), through=TODAY)
-        self.assertEqual((sorted(frozen.days), frozen.start), ([date(2026, 9, 2), date(2026, 9, 5)], date(2026, 9, 2)))
+        self.assertEqual((sorted(frozen.days), frozen.start), ([date(2026, 9, 1), date(2026, 9, 2), date(2026, 9, 5)], date(2026, 9, 1)))
         s = summarise(records, {}, TODAY, ledger=frozen)
-        self.assertEqual((s.first_day, s.total_tokens), (date(2026, 9, 2), 50))  # not 1049
+        self.assertEqual((s.first_day, s.total_tokens), (date(2026, 9, 1), 1049))
 
-    def test_the_first_full_day_is_the_day_after_the_cut_off_one_even_with_no_usage_on_it(self):
-        records = [rec(at(9, 1, 15), 999, 9.0), rec(at(9, 5, 9), 30, 0.3)]
-        s = summarise(records, {}, TODAY)
-        self.assertEqual((s.first_day, s.total_tokens, s.daily[0].tokens), (date(2026, 9, 2), 30, 0))
-
-    def test_the_first_full_day_is_saved_so_it_holds_once_the_cut_off_day_is_deleted(self):
+    def test_the_first_full_day_is_saved_so_it_holds_once_its_transcript_is_deleted(self):
         records = [rec(at(9, 1, 15), 999, 9.0), rec(at(9, 5, 9), 30, 0.3)]
         frozen = freeze(records, {}, TODAY, Ledger.empty(), through=TODAY)
-        self.assertEqual((sorted(frozen.days), frozen.start), ([date(2026, 9, 5)], date(2026, 9, 2)))
-        later = date(2026, 10, 29)  # 1 Sep's transcript is gone: the live data now starts on 5 Sep
-        self.assertEqual(summarise(records[1:], {}, later, ledger=history.parse(history.dump(frozen))).first_day, date(2026, 9, 2))
-        self.assertEqual(summarise(records[1:], {}, later).first_day, date(2026, 9, 6))  # without the saved start it moves
+        self.assertEqual(frozen.start, date(2026, 9, 1))
+        later = date(2026, 11, 2)  # 1 Sep's transcript is gone: the live data now starts on 5 Sep
+        self.assertEqual(summarise(records[1:], {}, later, ledger=history.parse(history.dump(frozen))).first_day, date(2026, 9, 1))
+        self.assertEqual(summarise(records[1:], {}, later).first_day, date(2026, 9, 5))  # without the saved start it moves
 
-    def test_a_first_record_before_0200_is_a_full_day(self):
-        records = [rec(at(9, 1, 1, 59), 11, 0.1), rec(at(9, 5, 9), 30, 0.3)]
-        self.assertIsNone(cut_off_day(records, Ledger.empty(), TODAY))
-        self.assertEqual(summarise(records, {}, TODAY).first_day, date(2026, 9, 1))
-        self.assertEqual(cut_off_day([rec(at(9, 1, 2, 0), 11, 0.1)], Ledger.empty(), TODAY), date(2026, 9, 1))
-
-    def test_a_young_oldest_day_is_a_real_start_and_a_day_the_history_has_is_never_cut_off(self):
-        young = [rec(at(10, 20, 15), 5, 0.1)]
-        self.assertIsNone(cut_off_day(young, Ledger.empty(), TODAY))
-        self.assertEqual(summarise(young, {}, TODAY).first_day, date(2026, 10, 20))
-        old = [rec(at(9, 1, 15), 5, 0.1)]
-        self.assertIsNone(cut_off_day(old, ledger_of(d0901=[row("claude", OPUS, 5, 0.1)]), TODAY))
-        self.assertIsNone(cut_off_day(old, ledger_of(d0831=[row("claude", OPUS, 5, 0.1)]), TODAY))
-        self.assertIsNone(cut_off_day(old, Ledger({}, date(2026, 9, 3)), TODAY))
+    def test_a_young_first_day_is_a_real_start(self):
+        self.assertEqual(summarise([rec(at(10, 20, 15), 5, 0.1)], {}, TODAY).first_day, date(2026, 10, 20))
 
     def test_records_before_the_cleanup_point_do_not_start_the_history(self):
         # A resumed transcript keeps a lone 1 Aug message; the files of 2 Aug to 29 Aug may be gone, so 30 Aug starts.
@@ -161,14 +144,13 @@ class PartialFirstDayTests(Base):
 class LongHistoryToolTests(Base):
     def test_cursor_days_before_the_file_based_tools_start_do_not_move_the_start(self):
         records = [rec(at(8, 31, 10), 999, 9.0, "cursor", "cursor-auto"),   # Cursor's server keeps more than the 60-day files
-                   rec(at(9, 1, 15), 888, 8.0),                              # Claude Code's oldest day: cut off
+                   rec(at(9, 1, 15), 888, 8.0),                              # Claude Code's oldest day
                    rec(at(9, 2, 9), 20, 0.2), rec(at(9, 2, 10), 5, 0.05, "cursor", "cursor-auto")]
-        self.assertEqual(cut_off_day(records, Ledger.empty(), TODAY), date(2026, 9, 1))
         frozen = freeze(records, {}, TODAY, Ledger.empty(), through=TODAY)
-        self.assertEqual(sorted(frozen.days), [date(2026, 9, 2)])
+        self.assertEqual(sorted(frozen.days), [date(2026, 9, 1), date(2026, 9, 2)])
         s = summarise(records, {}, TODAY, ledger=frozen)
         self.assertEqual((s.first_day, s.total_tokens, [(t.label, t.tokens) for t in s.tools]),
-                         (date(2026, 9, 2), 25, [("Claude Code", 20), ("Cursor", 5)]))
+                         (date(2026, 9, 1), 913, [("Claude Code", 908), ("Cursor", 5)]))
 
     def test_with_only_cursor_data_it_sets_the_start_itself_but_not_before_the_cleanup_point(self):
         self.assertEqual(summarise([rec(at(9, 3, 1), 7, 0.1, "cursor", "cursor-auto")], {}, TODAY).first_day, date(2026, 9, 3))
@@ -373,8 +355,8 @@ class CliHistoryTests(Base):
         self.assertEqual(self.run_cli("--out", str(self.out), "--history", str(self.history)), 0)
         first = self.history.read_bytes()
         self.assertEqual(json.loads(first), {"version": 1, "start": "2026-08-20", "days": {"2026-09-04": [
-            {"tool": "claude", "model": OPUS, "tokens": 120, "cost_usd": 0.0002}]}})  # 1 Aug is before the start, 1 Sep is T3's Claude copy (ignored)
-        self.assertIn("saved 1 new days", self.log())
+            {"tool": "claude", "model": OPUS, "tokens": 120, "cost_usd": 0.0002}]}})  # 1 Aug is before the start, 19 Aug is T3's Claude copy (ignored)
+        self.assertIn("saved 1 new days and the start 2026-08-20 to", self.log())
         cards = {p.name: p.read_bytes() for p in self.out.iterdir()}
         self.assertEqual(self.run_cli("--out", str(self.out), "--history", str(self.history)), 0)
         self.assertEqual(self.history.read_bytes(), first)
@@ -390,7 +372,7 @@ class CliHistoryTests(Base):
     def test_a_trial_run_with_out_does_not_save_unless_history_is_given(self):
         self.assertEqual(self.run_cli("--out", str(self.out)), 0)
         self.assertFalse((self.tmp / "default-history.json").exists())
-        self.assertIn("trial run: 1 new days not saved", self.log())
+        self.assertIn("trial run: 1 new days and the start 2026-08-20 not saved", self.log())
 
     def test_a_corrupt_history_refuses_the_run_and_is_not_overwritten(self):
         self.history.parent.mkdir(parents=True)
@@ -409,6 +391,24 @@ class CliHistoryTests(Base):
         self.assertEqual(history.load(self.history), Ledger(saved.days, date(2026, 8, 20)))  # live says 120 tokens; the frozen 5 stays
         # T3's other tools 5856 + Claude Code 5570 + the saved 5 = 11431 tokens; $0.5 + 0.032005 (without the 0.0002 for the live 120)
         self.assertIn('aria-label="AI usage since 20 Aug 2026: 11.4K tokens, $0.53 API-equivalent"', (self.out / "ai-usage-dark.svg").read_text())
+        self.assertIn("saved 0 new days and the start 2026-08-20 to", self.log())  # only the start changed
+
+    def test_a_failed_publish_still_saves_the_history(self):
+        # Publishing can fail for days (an expired gh login); the frozen days must not wait on it past the 60-day cleanup.
+        failure = mock.patch.object(cli.publisher, "publish", side_effect=cli.publisher.PublishError("push rejected"))
+        with failure:
+            self.assertEqual(self.run_cli("--history", str(self.history), "--clone", str(self.tmp / "clone")), 1)
+        self.assertEqual(sorted(history.load(self.history).days), [date(2026, 9, 4)])
+        self.assertIn("refused: PublishError: push rejected", self.log())
+
+    def test_a_run_refused_for_no_recent_usage_still_freezes_days_the_cleanup_would_take(self):
+        # 24 Oct: nothing used for six days, so no card; 4 Sep is 50 days old and is saved, days younger than that wait.
+        fx.write_lines(self.projects / "-proj-a" / "chat8.jsonl", [fx.reply(OPUS, (9, 5, 4), fx.usage(7, 0), msg="msg_g", req="req_g")])
+        now = datetime(2026, 10, 24, 6, 0, tzinfo=TIMEZONE)
+        self.assertEqual(self.run_cli("--out", str(self.out), "--history", str(self.history), now=now), 1)
+        self.assertFalse(self.out.exists())
+        self.assertEqual((sorted(history.load(self.history).days), history.load(self.history).start), ([date(2026, 9, 4)], date(2026, 8, 26)))
+        self.assertIn("no source has recent usage", self.log())
 
 
 if __name__ == "__main__":

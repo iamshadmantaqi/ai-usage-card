@@ -36,7 +36,12 @@ log = logging.getLogger("ai-usage-card")
 
 
 class Refused(Exception):
-    """The data is not fit to publish."""
+    """The data is not fit to publish. `history` is the history with the days still frozen on the way, to be saved
+    anyway, or None when the data is not fit for that either."""
+
+    def __init__(self, message: str, history: Optional[Ledger] = None):
+        super().__init__(message)
+        self.history = history
 
 
 def gather(userdata: Path, projects: Path, now: datetime) -> Tuple[List[UsageRecord], Optional[int]]:
@@ -80,19 +85,21 @@ def build(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: 
     if not records:
         raise Refused("no usage records found")
     newest_ms = max(r.timestamp_ms for r in records)
+    ledger = ledger or Ledger.empty()
+    rates, today = load_rates(userdata), now.astimezone(TIMEZONE).date()
     if now_ms - newest_ms > max_age_ms:
+        # No card, but days old enough for Claude Code's cleanup are still frozen, so time away does not lose them.
         raise Refused("newest record is %.0f hours old (limit %d): no source has recent usage"
-                      % ((now_ms - newest_ms) / 3.6e6, MAX_RECORD_AGE.total_seconds() / 3600))
+                      % ((now_ms - newest_ms) / 3.6e6, MAX_RECORD_AGE.total_seconds() / 3600),
+                      freeze(records, rates, today, ledger, None))
     if t3_newest is None or now_ms - t3_newest > max_age_ms:
         log.warning("T3 Code's caches are %s: Cursor, Codex and other tools may be missing recent days"
                     " (open its usage page)", "missing" if t3_newest is None else "%.0f hours old" % ((now_ms - t3_newest) / 3.6e6))
-    ledger = ledger or Ledger.empty()
-    rates, today = load_rates(userdata), now.astimezone(TIMEZONE).date()
     # A day is frozen once T3 Code's caches reach past it (they are saved when its usage page is open), or once it
     # is old enough that Claude Code's cleanup would otherwise take its transcripts first.
     through = local_day(t3_newest) - timedelta(days=1) if t3_newest is not None else None
     if through is None or through < last_frozen_day(today, through):
-        log.warning("T3 Code's caches end %s: days from %s on are frozen without waiting for them",
+        log.warning("T3 Code's caches end %s: days up to %s are frozen without waiting for them",
                     "nowhere in the window" if through is None else through.isoformat(), last_frozen_day(today, through).isoformat())
     frozen = freeze(records, rates, today, ledger, through)
     summary = summarise(records, rates, today, newest_ms, frozen)
@@ -104,6 +111,22 @@ def build(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: 
              period_label(summary).lower(), fmt_tokens(summary.total_tokens), fmt_cost(summary.total_cost_usd),
              len(summary.weekly), summary.updated.isoformat(), len(frozen.days), len(frozen.days) - len(ledger.days))
     return cards, frozen
+
+
+def keep_history(path: Path, saved: Ledger, frozen: Ledger, trial: bool) -> None:
+    """Saves `frozen` when it differs from `saved`, or only logs it in a trial run. Raises LedgerError."""
+    if frozen == saved:
+        return
+    change = "%d new days%s" % (len(frozen.days) - len(saved.days),
+                                "" if frozen.start == saved.start else " and the start %s" % frozen.start)
+    if trial:
+        log.info("trial run: %s not saved to %s (pass --history to save them)", change, path)
+        return
+    try:
+        ledger_file.save(path, frozen)
+    except OSError as error:
+        raise LedgerError("history file %s cannot be written (%s: %s)" % (path, type(error).__name__, error))
+    log.info("saved %s to %s", change, path)
 
 
 def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> int:
@@ -126,28 +149,37 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
     try:
         history_path = args.history or DEFAULT_HISTORY
         saved = ledger_file.load(history_path)  # a corrupt file refuses the run here, before anything can overwrite it
-        cards, frozen = build(args.userdata, now or datetime.now(TIMEZONE), args.claude_projects, saved)
-        added = len(frozen.days) - len(saved.days)
+        try:
+            cards, frozen = build(args.userdata, now or datetime.now(TIMEZONE), args.claude_projects, saved)
+        except Refused as error:
+            if error.history is None:
+                raise
+            log.error("refused: %s: %s", type(error).__name__, error)
+            keep_history(history_path, saved, error.history, trial=bool(args.out and not args.history))
+            return 1
+        failed = False
         if args.out:
             args.out.mkdir(parents=True, exist_ok=True)
             for name, svg in cards.items():
                 (args.out / name).write_text(svg, encoding="utf-8")
             log.info("wrote %d files to %s", len(cards), args.out)
-        elif publisher.publish(cards, args.repo, args.clone, args.git_credential_helper or None):
-            log.info("published a new card to branch %s", publisher.BRANCH)
         else:
-            log.info("card unchanged, nothing committed")
-        # Saved after the card is out, so a history that cannot be written does not hold the card back; the days
-        # it would have added are still live, and the next run saves them.
-        if frozen != saved and args.out and not args.history:
-            log.info("trial run: %d new days not saved to %s (pass --history to save them)", added, history_path)
-        elif frozen != saved:
             try:
-                ledger_file.save(history_path, frozen)
-            except OSError as error:
-                raise LedgerError("history file %s cannot be written (%s: %s)" % (history_path, type(error).__name__, error))
-            log.info("saved %d new days to %s", added, history_path)
-        return 0
+                if publisher.publish(cards, args.repo, args.clone, args.git_credential_helper or None):
+                    log.info("published a new card to branch %s", publisher.BRANCH)
+                else:
+                    log.info("card unchanged, nothing committed")
+            except publisher.PublishError as error:
+                log.error("refused: %s: %s", type(error).__name__, error)
+                failed = True
+            except Exception:
+                log.exception("unexpected failure while publishing")
+                failed = True
+        # Saved after the card is out, so a history that cannot be written does not hold the card back (the days it
+        # would have added are still live, and the next run saves them), and saved when publishing fails, so days
+        # frozen while it keeps failing are not left to Claude Code's cleanup.
+        keep_history(history_path, saved, frozen, trial=bool(args.out and not args.history))
+        return 1 if failed else 0
     except (Refused, CacheError, PrivacyError, LedgerError, publisher.PublishError) as error:
         log.error("refused: %s: %s", type(error).__name__, error)
         return 1

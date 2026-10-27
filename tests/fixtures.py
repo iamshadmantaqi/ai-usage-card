@@ -35,7 +35,7 @@ A1 = row(ms(10, 17, 12), "claude-opus-5-5", 0, 1000, 2000, 3000, 4000, "msg_a:re
 A2 = row(ms(10, 17, 13), "claude-opus-5-5", 0, 100, 0, 0, 200, "msg_b:req_b", speed=FAST)  # 300 tokens, $0.0022 (fast = 2x)
 A3 = row(ms(10, 17, 14), "<synthetic>", 0, 5000, 0, 0, 0, "msg_s:req_s")  # excluded
 A4 = row(ms(10, 16, 9), "claude-sonnet-5-5", 0, 500, 10000, 0, 500, "msg_c:req_c")  # 11000 tokens, $0.007
-A5 = row(ms(9, 1, 9), "claude-opus-5-5", 0, 999999, 0, 0, 0, "msg_old:req_old")  # before the window
+A5 = row(ms(8, 19, 9), "claude-opus-5-5", 0, 999999, 0, 0, 0, "msg_old:req_old")  # before the cleanup point (20 Aug)
 B1 = row(ms(10, 18, 1), "claude-opus-5-5", 0, 10, 0, 0, 10, "msg_d:req_d", cost=0.5)  # 20 tokens, reported $0.5
 CODEX = row(ms(10, 18, 2), "gpt-6-luna", 1, 100, 200, 0, 50)  # 350 tokens, $0.000055 (cache falls back to input rate)
 E1 = row(ms(10, 15, 9), "mystery-model", 2, 1000, 0, 0, 1000)  # 2000 tokens, unpriced: $0

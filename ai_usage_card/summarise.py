@@ -28,7 +28,6 @@ FREEZE_AFTER_DAYS = 30  # a day this old or older is saved to the history and re
 # Claude Code deletes transcripts 60 days after their last write. A day this old is frozen even when T3 Code's caches
 # have not caught up with it, since waiting longer would lose its Claude Code usage for good.
 FORCE_FREEZE_DAYS = 50
-PARTIAL_AFTER_HOUR = 2  # the oldest day of the first run is cut off if its first record is at or after 2:00 AM Dhaka
 # Claude Code's transcript cleanup (`cleanupPeriodDays`, 60 on this Mac). A transcript that was resumed or forked keeps
 # older messages past it, but a day before the cleanup point may have lost other files, so it is never a full day.
 CLEANUP_DAYS = 60
@@ -171,35 +170,15 @@ def first_complete_day(today: date) -> date:
     return today - timedelta(days=CLEANUP_DAYS - 1)
 
 
-def cut_off_day(records: Iterable[UsageRecord], ledger: Ledger, today: date) -> Optional[date]:
-    """The oldest live day when it is cut off part way, else None.
-
-    Claude Code deletes a transcript 60 days after its last write, so the oldest day it still holds
-    keeps only the files written after the cut. That day is told by its first record: at or after
-    2:00 AM Dhaka means the morning is missing. The test only applies to the first run, before the history
-    has a start, and only to a day old enough to be frozen: a younger oldest day is a real start of
-    use. A person who really starts after 2:00 AM loses that one day, which is harmless."""
-    stamps = [r.timestamp_ms for r in _anchor(records)]
-    if not stamps or ledger.start is not None:
-        return None
-    first = local_dt(min(stamps))
-    day = first.date()
-    if today - day < timedelta(days=FREEZE_AFTER_DAYS) or any(known <= day for known in ledger.days):
-        return None
-    return day if first.hour >= PARTIAL_AFTER_HOUR else None
-
-
 def history_start(records: Iterable[UsageRecord], ledger: Ledger, today: date) -> date:
-    """The first full day: the saved start once there is one. Before that (the first run), the day after a
-    cut-off one or the first day any live data has, but never before the cleanup point, since older records are
-    only what resumed transcripts kept; or the first saved day, if earlier; else today."""
+    """The first full day: the saved start once there is one. Before that (the first run), the first day any live
+    data has, but never before the cleanup point, since older records are only what resumed transcripts kept (a day
+    on or after it cannot have been cut, so it is a real first day); or the first saved day, if earlier; else today."""
     if ledger.start is not None:
         return ledger.start
-    records = list(records)
-    skip = cut_off_day(records, ledger, today)
     saved = list(_frozen(ledger, today))
     live = [local_day(r.timestamp_ms) for r in _anchor(records)]
-    first_live = skip + timedelta(days=1) if skip else min(live) if live else None
+    first_live = min(live) if live else None
     candidates = saved + ([max(first_live, first_complete_day(today))] if first_live else [])
     return min(candidates) if candidates else today
 

@@ -256,7 +256,7 @@ class ClaudeTranscriptTests(Case):
                            "codex\0" + str(self.tmp / "codex"): {"dir": str(self.tmp / "codex")}}
         fx.write_userdata(self.userdata, scan=scan)
         records, _ = cli.gather(self.userdata, self.projects, fx.NOW)
-        # 2 is the 1 Aug transcript, inside the six-month floor now (summarise drops that cut-off day, see test_history)
+        # 2 is the 1 Aug transcript, inside the six-month floor now (summarise starts at the cleanup point, see test_history)
         self.assertEqual(sorted(r.tokens.total for r in records if r.provider == "claude"), [2, 100, 170, 300, 5100])
 
     def test_refuses_when_t3_has_claude_usage_but_the_transcripts_give_none(self):
@@ -272,6 +272,14 @@ class ClaudeTranscriptTests(Case):
         self.assertEqual(cli.gather(self.userdata, self.projects, fx.NOW)[1], fx.ms(9, 1, 0))
         fx.write_userdata(self.userdata, cursor_enabled=False)  # Cursor off: the scan cache alone decides
         self.assertEqual(cli.gather(self.userdata, self.projects, fx.NOW)[1], fx.ms(10, 18, 2))
+
+    def test_the_forced_freeze_warning_names_the_newest_day_it_freezes(self):
+        cursor = fx.cursor_cache()
+        cursor["accounts"]["keychain"]["untilMs"] = fx.ms(7, 1, 12)  # caches end 30 Jun; 18 Oct - 50 days is 29 Aug
+        fx.write_userdata(self.userdata, cursor=cursor)
+        with self.assertLogs("ai-usage-card", "WARNING") as logs:
+            cli.build(self.userdata, fx.NOW, self.projects)
+        self.assertIn("T3 Code's caches end 2026-06-30: days up to 2026-08-29 are frozen without waiting", "\n".join(logs.output))
 
     def test_t3s_claude_records_are_ignored_but_its_other_tools_still_count(self):
         records, t3_newest = cli.gather(self.userdata, self.projects, fx.NOW)
@@ -329,20 +337,20 @@ class SummaryTests(Case):
     def test_window_totals(self):
         s = self.summary()
         # 10000 + 300 + 11000 + 20 (claude) + 350 (codex) + 2006 (grok) + 3500 (cursor); the synthetic row is out, and so is
-        # the 1 Sep record: the oldest day with no history yet, its first record at 09:00, so it is cut off (see test_history)
+        # the 19 Aug record: before the cleanup point (20 Aug), so only what a resumed transcript kept (see test_history)
         self.assertEqual(s.total_tokens, 27176)
         # 0.02495 + 0.0022 + 0.007 + 0.5 (reported) + 0.000055 + 0 + 0.0123 (reported)
         self.assertAlmostEqual(s.total_cost_usd, 0.546505, places=6)
-        self.assertEqual((s.first_day, s.last_day, s.updated), (date(2026, 9, 2), TODAY, TODAY))
+        self.assertEqual((s.first_day, s.last_day, s.updated), (date(2026, 8, 20), TODAY, TODAY))
 
     def test_daily_buckets_use_dhaka_days(self):
         by_day = {d.day: d.tokens for d in self.summary().daily}
-        self.assertEqual(len(by_day), 47)  # 2 Sep to 18 Oct
+        self.assertEqual(len(by_day), 60)  # 20 Aug to 18 Oct
         self.assertEqual(by_day[date(2026, 10, 18)], 3870)  # 20 + 350 + 3500; 01:00 Dhaka is still 17 Oct in UTC
         self.assertEqual(by_day[date(2026, 10, 17)], 10300)
         self.assertEqual(by_day[date(2026, 10, 16)], 11000)
         self.assertEqual(by_day[date(2026, 10, 15)], 2006)
-        self.assertEqual(by_day[date(2026, 9, 2)], 0)
+        self.assertEqual(by_day[date(2026, 8, 20)], 0)
 
     def test_split_by_tool(self):
         tools = [(t.label, t.tokens) for t in self.summary().tools]
