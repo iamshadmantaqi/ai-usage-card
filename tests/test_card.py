@@ -71,14 +71,35 @@ class LoadTests(Case):
         self.assertEqual([r.dedupe_key for r in load_records(self.userdata) if r.provider == "cursor"],
                          ["cursor-account:k:1:0"])
 
-    def test_a_newer_cache_version_beside_ours_is_refused(self):
-        for name in ("usage-scan-cache-v6.json", "usage-cursor-account-cache-v2.json"):
+    def test_reads_a_version_9_cache_the_way_it_reads_version_5(self):
+        v5 = sorted((r.provider, r.model, r.tokens.total) for r in load_records(self.userdata))
+        v9 = fx.write_userdata(self.tmp / "userdata9", scan=fx.scan_cache_v9(), scan_version=9)
+        self.assertEqual(sorted((r.provider, r.model, r.tokens.total) for r in load_records(v9)), v5)
+        self.assertIn(("codex", "gpt-6-luna", 350), v5)
+
+    def test_the_newest_supported_cache_file_is_the_one_read(self):
+        # v5 still holds A1's 10000 tokens; the v9 file, written later by T3, has none of the Claude files.
+        scan = fx.scan_cache_v9()
+        scan["files"] = {k: v for k, v in scan["files"].items() if v["p"] != "claude"}
+        fx.write_userdata(self.userdata, scan=scan, scan_version=9)
+        self.assertEqual({r.provider for r in load_records(self.userdata)}, {"codex", "grok", "cursor"})
+
+    def test_a_cache_version_newer_than_the_ones_checked_is_refused(self):
+        for name in ("usage-scan-cache-v10.json", "usage-cursor-account-cache-v2.json"):
             (self.userdata / name).write_text("{}")
-            with self.assertRaises(CacheError, msg=name):
+            with self.assertRaises(CacheError, msg=name) as caught:
                 load_records(self.userdata)
+            self.assertIn("T3 Code now writes " + name, str(caught.exception))
             (self.userdata / name).unlink()
         (self.userdata / "usage-scan-cache-v4.json").write_text("{}")  # an older one left behind is fine
         load_records(self.userdata)
+
+    def test_a_file_whose_version_field_is_not_a_supported_one_is_refused(self):
+        scan = fx.scan_cache_v9()
+        scan["version"] = 10
+        fx.write_userdata(self.tmp / "u10", scan=scan, scan_version=9)
+        with self.assertRaises(CacheError):
+            load_records(self.tmp / "u10")
 
     def test_files_with_a_read_position_t3_rejects_are_skipped(self):
         scan = fx.scan_cache()
@@ -465,7 +486,7 @@ class CliTests(Case):
 
     def test_refuses_an_unsupported_cache_version(self):
         scan = fx.scan_cache()
-        scan["version"] = 6
+        scan["version"] = 10
         fx.write_userdata(self.userdata, scan=scan)
         self.assertEqual(self.run_cli("--out", str(self.tmp / "out")), 1)
         self.assertIn("unsupported scan cache version", (self.tmp / "card.log").read_text())

@@ -3,13 +3,17 @@
 The record layouts below were read from T3 Code's own source (the bundled server,
 `usageScanCache.ts` and `accountUsage.ts` in `provider-cursor`), not guessed.
 
-Scan cache `usage-scan-cache-v5.json`::
+Scan cache `usage-scan-cache-v<N>.json`, N from 5 to 9 (T3 writes each version to its own file)::
 
-    {sources, version: 5, models: [name], sessions: [id], files: {path: entry}}
-    entry  = {s: size, m: mtimeMs, p: provider, r: [row], t: [row], o, gl, gh, cs}
+    {sources, version: N, models: [name], sessions: [id], files: {path: entry}}
+    entry  = {s: size, m: mtimeMs, p: provider, r: [row], t: [row], mr, o, gl, gh, cs}
     row    = [timestampMs, modelIdx, sessionIdx, uncachedInput, cachedInput,
               cacheCreation, output, reasoning, dedupeKey, reportedCostUsd,
-              speedIdx, rateModelIdx]          (speedIdx: 0 standard, 1 fast, 2 ultrafast)
+              speedIdx, rateModelIdx, serviceTierTurnId]   (speedIdx: 0 standard, 1 fast, 2 ultrafast)
+
+Versions 6 to 9 left the first twelve row fields alone. Version 7 added the optional last one
+(a string, not a usage figure) and `mr` (a count of malformed lines in the file); the rest of the
+changes, up to 9, are to how T3 resumes reading Codex files. None of that is read here.
 
 Cursor cache `usage-cursor-account-cache-v1.json`::
 
@@ -28,10 +32,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-SCAN_CACHE_FILE = "usage-scan-cache-v5.json"
+SCAN_CACHE_STEM = "usage-scan-cache-v"
 CURSOR_CACHE_FILE = "usage-cursor-account-cache-v1.json"
 SETTINGS_FILE = "settings.json"
-SCAN_CACHE_VERSION = 5
+SCAN_CACHE_VERSIONS = (5, 6, 7, 8, 9)
 CURSOR_CACHE_VERSION = 1
 SPEEDS = ("standard", "fast", "ultrafast")
 # T3 re-keys records of these providers when one session spans several files.
@@ -135,10 +139,27 @@ def _decode_scan_rows(rows: Any, provider: str, models: List[str], sessions: Lis
     return records
 
 
+def scan_cache_path(folder: Path) -> Path:
+    """The newest scan cache file T3 has written. T3 gives each cache version its own file name and
+    leaves the old ones behind, frozen, so the highest number is the live one. A version this code has
+    not been checked against is refused rather than guessed at."""
+    found = {}  # type: Dict[int, Path]
+    for candidate in folder.glob(SCAN_CACHE_STEM + "*.json"):
+        number = candidate.name[len(SCAN_CACHE_STEM):-len(".json")]
+        if number.isdigit():
+            found[int(number)] = candidate
+    if not found:
+        raise CacheError("cache file is missing: %s%d.json" % (SCAN_CACHE_STEM, SCAN_CACHE_VERSIONS[-1]))
+    newest = max(found)
+    if newest not in SCAN_CACHE_VERSIONS:
+        raise CacheError("T3 Code now writes %s; this card reads only versions %d to %d"
+                         % (found[newest].name, SCAN_CACHE_VERSIONS[0], SCAN_CACHE_VERSIONS[-1]))
+    return found[newest]
+
+
 def _read_scan_document(path: Path) -> Dict[str, Any]:
-    _refuse_newer_version(path.parent, "usage-scan-cache-v", SCAN_CACHE_VERSION)
     document = _read_json(path)
-    if not isinstance(document, dict) or document.get("version") != SCAN_CACHE_VERSION:
+    if not isinstance(document, dict) or document.get("version") not in SCAN_CACHE_VERSIONS:
         raise CacheError("unsupported scan cache version: %r" % (document.get("version") if isinstance(document, dict) else None))
     models, sessions, files = document.get("models"), document.get("sessions"), document.get("files")
     if (not isinstance(models, list) or not isinstance(sessions, list) or not isinstance(files, dict)
@@ -295,7 +316,7 @@ def dedupe(per_file: List[List[UsageRecord]]) -> List[UsageRecord]:
 def load_t3(userdata_dir: Path, min_file_mtime_ms: float = 0) -> Tuple[List[UsageRecord], List[str]]:
     """Every usage record T3 Code knows about, de-duplicated, and the Claude Code transcript folders
     it scans (used only to read those folders, never stored). Raises CacheError if the scan cache is unusable."""
-    document = _read_scan_document(userdata_dir / SCAN_CACHE_FILE)
+    document = _read_scan_document(scan_cache_path(userdata_dir))
     per_file = _scan_records(document, min_file_mtime_ms)
     enabled = cursor_usage_enabled(userdata_dir / SETTINGS_FILE)
     cursor = load_cursor_cache(userdata_dir / CURSOR_CACHE_FILE) if enabled else []
