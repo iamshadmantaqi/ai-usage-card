@@ -1,8 +1,13 @@
-"""30-day totals. `Summary` is the only thing the renderer sees, and it holds nothing but model
-names, tool names, dates and numbers: no paths, session ids, message ids or project names."""
+"""Totals over a rolling six-month window. `Summary` is the only thing the renderer sees, and it holds
+nothing but model names, tool names, dates and numbers: no paths, session ids, message ids or project names.
+
+A day comes from exactly one source. Days at least `FREEZE_AFTER_DAYS` old are read from the saved
+history (`history.py`) when it has them; every other day comes from the live records (Claude Code's
+transcripts and T3 Code's caches). `freeze` copies live days into the history once they are old enough.
+"""
 from __future__ import annotations
 
-import re
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
@@ -13,27 +18,33 @@ try:  # Python 3.9+
 except Exception:  # pragma: no cover - a Mac without tzdata; Dhaka has no daylight saving
     TIMEZONE = timezone(timedelta(hours=6))
 
+from .history import Ledger, Row
 from .load import UsageRecord
 from .pricing import ModelRates, price
-from .privacy import looks_private
+from .privacy import safe_label
 
-WINDOW_DAYS = 30
+WINDOW_DAYS = 182  # six months, rolling, ending today
+FREEZE_AFTER_DAYS = 30  # a day this old or older is saved to the history and read from it from then on
+# Claude Code deletes transcripts 60 days after their last write. A day this old is frozen even when T3 Code's caches
+# have not caught up with it, since waiting longer would lose its Claude Code usage for good.
+FORCE_FREEZE_DAYS = 50
+# Claude Code's transcript cleanup (`cleanupPeriodDays`, 60 on this Mac). A transcript that was resumed or forked keeps
+# older messages past it, but a day before the cleanup point may have lost other files, so it is never a full day.
+CLEANUP_DAYS = 60
 TOP_MODELS = 6
 MAX_TOOLS = 4
+# Providers whose usage comes from their own servers (Cursor's account API), not from files that a cleanup deletes
+# after 60 days. They reach back further than the others, so they do not decide where the history starts.
+LONG_HISTORY_PROVIDERS = frozenset({"cursor"})
 EXCLUDED_MODELS = frozenset({"<synthetic>"})
 TOOL_LABELS = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok", "cursor": "Cursor",
                "opencode": "OpenCode", "antigravity": "Antigravity", "pi": "Pi"}
+OTHER_KEY = "other"
 OTHER_MODELS = "other"
 OTHER_TOOLS = "Other tools"
 # Names that mean nothing to a reader of the public card. Only the label changes: records keep
 # the source name, so pricing and exclusions still see it.
 DISPLAY_NAMES = {("cursor", "default"): "cursor-auto"}  # Cursor records its Auto model as "default"
-# Only plain model-name characters pass; anything else, or anything that looks like an id, is shown as "other".
-_SAFE_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-\[\] ]{0,63}$")
-
-
-def _safe(label: str) -> bool:
-    return bool(_SAFE_LABEL.match(label)) and not looks_private(label)
 
 
 @dataclass(frozen=True)
@@ -52,41 +63,66 @@ class Slice:
 
 
 @dataclass(frozen=True)
+class WeekTotal:
+    """One bar of the chart: a week starting Monday (Dhaka), clipped to the window. `current` is the
+    week that holds today, which is still being written."""
+    first: date
+    last: date
+    tokens: int
+    cost_usd: float
+    current: bool
+
+
+@dataclass(frozen=True)
 class Summary:
     updated: date
-    first_day: date
+    first_day: date  # the first day counted: the first full day of history, or the window's first day once it is full
     last_day: date
+    full_window: bool  # True when the history reaches back the whole window ("LAST 6 MONTHS")
     total_tokens: int
     total_cost_usd: float
     daily: List[DayTotal]
+    weekly: List[WeekTotal]
     tools: List[Slice]
     models: List[Slice]
 
 
+def local_dt(timestamp_ms: int) -> datetime:
+    return datetime.fromtimestamp(timestamp_ms / 1000.0, TIMEZONE)
+
+
 def local_day(timestamp_ms: int) -> date:
-    return datetime.fromtimestamp(timestamp_ms / 1000.0, TIMEZONE).date()
+    return local_dt(timestamp_ms).date()
 
 
-def window(today: date) -> List[date]:
-    return [today - timedelta(days=WINDOW_DAYS - 1 - i) for i in range(WINDOW_DAYS)]
+def window_first(today: date) -> date:
+    return today - timedelta(days=WINDOW_DAYS - 1)
 
 
 def window_start_ms(today: date) -> int:
     """Start of the window as T3 reads it: the first day at 00:00 UTC (T3 then adds 36 hours of slack for file mtimes)."""
-    first = window(today)[0]
+    first = window_first(today)
     return int(datetime(first.year, first.month, first.day, tzinfo=timezone.utc).timestamp() * 1000)
 
 
-def _tool_label(provider: str) -> str:
-    label = TOOL_LABELS.get(provider)
+def week_start(day: date) -> date:
+    return day - timedelta(days=day.weekday())  # Monday
+
+
+def _tool_key(provider: str) -> str:
+    return provider if safe_label(provider) else OTHER_KEY
+
+
+def _tool_label(key: str) -> str:
+    label = TOOL_LABELS.get(key)
     if label:
         return label
-    return provider.capitalize() if _safe(provider) else OTHER_TOOLS
+    return OTHER_TOOLS if key == OTHER_KEY else key.capitalize()
 
 
 def _model_label(record: UsageRecord) -> str:
     label = DISPLAY_NAMES.get((record.provider, record.model), record.model)
-    return label if _safe(label) else OTHER_MODELS
+    return label if safe_label(label) else OTHER_MODELS
 
 
 def _top(totals: Dict[str, List[float]], limit: int, other_label: str) -> List[Slice]:
@@ -101,35 +137,119 @@ def _top(totals: Dict[str, List[float]], limit: int, other_label: str) -> List[S
     return kept
 
 
-def summarise(records: Iterable[UsageRecord], rates: Dict[str, ModelRates], today: date,
-              newest_ms: Optional[int] = None) -> Summary:
-    days = window(today)
-    daily = {d: [0, 0.0] for d in days}
-    by_tool = {}  # type: Dict[str, List[float]]
-    by_model = {}  # type: Dict[str, List[float]]
-    newest = newest_ms or 0
+def live_days(records: Iterable[UsageRecord], rates: Dict[str, ModelRates]) -> Dict[date, List[Row]]:
+    """The live records as one row per day, tool and model, priced, with names already filtered. These are the rows
+    the history stores, so a negative or non-finite sum (a refund row, a bad rate) is stored as 0."""
+    table = {}  # type: Dict[date, Dict[tuple, List[float]]]
     for record in records:
-        newest = max(newest, record.timestamp_ms)
         if record.model in EXCLUDED_MODELS:
             continue
-        day = local_day(record.timestamp_ms)
-        if day not in daily:
-            continue
-        tokens, cost = record.tokens.total, price(rates, record)
-        daily[day][0] += tokens
-        daily[day][1] += cost
-        for table, label in ((by_tool, _tool_label(record.provider)),
-                             (by_model, _model_label(record))):
-            row = table.setdefault(label, [0, 0.0])
-            row[0] += tokens
-            row[1] += cost
+        cell = table.setdefault(local_day(record.timestamp_ms), {}).setdefault(
+            (_tool_key(record.provider), _model_label(record)), [0, 0.0])
+        cell[0] += record.tokens.total
+        cell[1] += price(rates, record)
+    return {day: [Row(tool, model, max(0, int(v[0])), v[1] if math.isfinite(v[1]) and v[1] > 0 else 0.0)
+                  for (tool, model), v in sorted(cells.items())]
+            for day, cells in table.items()}
+
+
+def _frozen(ledger: Ledger, today: date) -> Dict[date, List[Row]]:
+    """The history days that are read from the history: old enough, and not in the future. A younger day is always live."""
+    return {day: rows for day, rows in ledger.days.items() if timedelta(days=FREEZE_AFTER_DAYS) <= today - day}
+
+
+def _anchor(records: Iterable[UsageRecord]) -> List[UsageRecord]:
+    """The records that decide where the history starts: the file-based tools, which the 60-day cleanup cuts. With
+    only long-history tools in the data, those are used."""
+    usable = [r for r in records if r.model not in EXCLUDED_MODELS]
+    return [r for r in usable if r.provider not in LONG_HISTORY_PROVIDERS] or usable
+
+
+def first_complete_day(today: date) -> date:
+    """The oldest day the cleanup cannot have cut: every file with a record on it was written on or after it."""
+    return today - timedelta(days=CLEANUP_DAYS - 1)
+
+
+def history_start(records: Iterable[UsageRecord], ledger: Ledger, today: date) -> date:
+    """The first full day: the saved start once there is one. Before that (the first run), the first day any live
+    data has, but never before the cleanup point, since older records are only what resumed transcripts kept (a day
+    on or after it cannot have been cut, so it is a real first day); or the first saved day, if earlier; else today."""
+    if ledger.start is not None:
+        return ledger.start
+    saved = list(_frozen(ledger, today))
+    live = [local_day(r.timestamp_ms) for r in _anchor(records)]
+    first_live = min(live) if live else None
+    candidates = saved + ([max(first_live, first_complete_day(today))] if first_live else [])
+    return min(candidates) if candidates else today
+
+
+def last_frozen_day(today: date, through: Optional[date]) -> date:
+    """The newest day `freeze` saves: 30 days old and covered by T3 Code's caches, or 50 days old regardless."""
+    forced = today - timedelta(days=FORCE_FREEZE_DAYS)
+    if through is None:
+        return forced
+    return max(forced, min(today - timedelta(days=FREEZE_AFTER_DAYS), through))
+
+
+def freeze(records: Iterable[UsageRecord], rates: Dict[str, ModelRates], today: date, ledger: Ledger,
+           through: Optional[date] = None) -> Ledger:
+    """The history with every live day old enough added once. A saved day is never changed. `through`
+    is the last day whose data is complete in T3 Code's caches (they are saved only when its usage page is open,
+    so days after that may be missing for the tools they read); None means they cover no day. Days before the
+    history's first full day are left out, and that day is saved with the first day frozen past it."""
+    records = list(records)
+    start = history_start(records, ledger, today)
+    newest = last_frozen_day(today, through)
+    added = {day: rows for day, rows in live_days(records, rates).items()
+             if start <= day <= newest and day not in ledger.days}
+    fixed = ledger.start if ledger.start is not None else start if start <= newest else None
+    if not added and fixed == ledger.start:
+        return ledger
+    return Ledger({**ledger.days, **added}, fixed)
+
+
+def summarise(records: Iterable[UsageRecord], rates: Dict[str, ModelRates], today: date,
+              newest_ms: Optional[int] = None, ledger: Optional[Ledger] = None) -> Summary:
+    ledger = ledger or Ledger.empty()
+    records = list(records)
+    newest = max([newest_ms or 0] + [r.timestamp_ms for r in records])
+    saved = _frozen(ledger, today)
+    earliest = history_start(records, ledger, today)
+    live = {day: rows for day, rows in live_days(records, rates).items() if day not in saved and day >= earliest}
+    first = max(earliest, window_first(today))
+    days = [first + timedelta(days=i) for i in range((today - first).days + 1)]
+    by_day = {day: saved.get(day) or live.get(day) or [] for day in days}
+    by_tool = {}  # type: Dict[str, List[float]]
+    by_model = {}  # type: Dict[str, List[float]]
+    daily = []
+    for day in days:
+        tokens, cost = 0, 0.0
+        for row in by_day[day]:
+            tokens += row.tokens
+            cost += row.cost_usd
+            for table, label in ((by_tool, _tool_label(row.tool)), (by_model, row.model)):
+                cell = table.setdefault(label, [0, 0.0])
+                cell[0] += row.tokens
+                cell[1] += row.cost_usd
+        daily.append(DayTotal(day, tokens, cost))
+    weekly = []
+    this_week = week_start(today)
+    for total in daily:
+        monday = week_start(total.day)
+        if weekly and weekly[-1][0] == monday:
+            bar = weekly[-1][1]
+            bar[1], bar[2], bar[3] = total.day, bar[2] + total.tokens, bar[3] + total.cost_usd
+        else:
+            weekly.append((monday, [total.day, total.day, total.tokens, total.cost_usd]))
     return Summary(
         updated=local_day(newest) if newest else today,
-        first_day=days[0],
-        last_day=days[-1],
-        total_tokens=sum(int(v[0]) for v in daily.values()),
-        total_cost_usd=sum(v[1] for v in daily.values()),
-        daily=[DayTotal(d, int(daily[d][0]), daily[d][1]) for d in days],
+        first_day=first,
+        last_day=today,
+        full_window=earliest <= window_first(today),
+        total_tokens=sum(d.tokens for d in daily),
+        total_cost_usd=sum(d.cost_usd for d in daily),
+        daily=daily,
+        weekly=[WeekTotal(v[0], v[1], v[2], v[3], monday == this_week) for monday, v in weekly],
         tools=_top(by_tool, MAX_TOOLS if len(by_tool) <= MAX_TOOLS else MAX_TOOLS - 1, OTHER_TOOLS),
         models=_top(by_model, TOP_MODELS, OTHER_MODELS),
     )

@@ -17,6 +17,10 @@ FORBIDDEN = (
 )
 
 
+# Only plain model-name characters pass; anything else, or anything that looks like an id, is not a safe label.
+_SAFE_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-\[\] ]{0,63}$")
+
+
 class PrivacyError(Exception):
     """The output holds something that looks like a path or an id."""
 
@@ -29,3 +33,8 @@ def check_privacy(text: str) -> None:
     for pattern in FORBIDDEN:
         if pattern.search(text):
             raise PrivacyError("output matches forbidden pattern %s" % pattern.pattern)
+
+
+def safe_label(label: str) -> bool:
+    """True for a plain model or tool name: the only kind that may reach the card or the history file."""
+    return bool(_SAFE_LABEL.fullmatch(label)) and not looks_private(label)

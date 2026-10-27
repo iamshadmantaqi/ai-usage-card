@@ -12,13 +12,14 @@ from datetime import date
 from typing import List
 from xml.sax.saxutils import escape
 
-from .summarise import Summary
+from .summarise import Summary, WeekTotal
 
 WIDTH, HEIGHT = 840, 392
 PHONE_WIDTH = 400
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 SANS = "'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
 MONO = "'Courier New', ui-monospace, monospace"
+CURRENT_WEEK_OPACITY = 0.4
 
 
 @dataclass(frozen=True)
@@ -80,18 +81,29 @@ def _text(x: float, y: float, content: str, size: int, fill: str, anchor: str = 
             % (x, y, family, size, weight, fill, anchor, extra, escape(content)))
 
 
+def period_label(summary: Summary) -> str:
+    """The card's period: the real first day while the history is still growing, then the rolling six months."""
+    return "LAST 6 MONTHS" if summary.full_window else "SINCE " + fmt_date(summary.first_day).upper()
+
+
+def _week_title(week: WeekTotal) -> str:
+    span = fmt_day(week.first) if week.first == week.last else "%s to %s" % (fmt_day(week.first), fmt_day(week.last))
+    return "%s%s: %s, %s" % (span, " (so far)" if week.current else "", fmt_tokens(week.tokens), fmt_cost(week.cost_usd))
+
+
 def _chart(summary: Summary, theme: Theme, x0: float, baseline: float, width: float, height: float) -> List[str]:
+    """One bar per week, Monday to Sunday. The current week is drawn faded: it is not finished, so a low bar there is not a drop."""
     parts = []
-    peak = max([d.tokens for d in summary.daily] + [0])
-    slot = width / len(summary.daily)
+    peak = max([w.tokens for w in summary.weekly] + [0])
+    slot = width / max(len(summary.weekly), 1)
     bar = slot * 0.76
-    for i, day in enumerate(summary.daily):
+    for i, week in enumerate(summary.weekly):
         x = round(x0 + i * slot + (slot - bar) / 2, 2)
-        if day.tokens > 0:
-            h = max(2.0, round(day.tokens / peak * height, 2))
-            parts.append('<rect x="%s" y="%s" width="%s" height="%s" rx="2" fill="%s"><title>%s: %s, %s</title></rect>'
-                         % (x, round(baseline - h, 2), round(bar, 2), h, theme.bars, fmt_day(day.day),
-                            fmt_tokens(day.tokens), fmt_cost(day.cost_usd)))
+        if week.tokens > 0:
+            h = max(2.0, round(week.tokens / peak * height, 2))
+            parts.append('<rect x="%s" y="%s" width="%s" height="%s" rx="2" fill="%s"%s><title>%s</title></rect>'
+                         % (x, round(baseline - h, 2), round(bar, 2), h, theme.bars,
+                            ' fill-opacity="%s"' % CURRENT_WEEK_OPACITY if week.current else "", escape(_week_title(week))))
         else:  # a real zero is drawn as a thin stub, never left blank
             parts.append('<rect x="%s" y="%s" width="%s" height="1.5" fill="%s"/>' % (x, baseline - 1.5, round(bar, 2), theme.muted))
     parts.append('<line x1="%s" y1="%s" x2="%s" y2="%s" stroke="%s" stroke-width="1"/>' % (x0, baseline + 0.5, x0 + width, baseline + 0.5, theme.border))
@@ -104,7 +116,8 @@ def _heading(x: float, y: float, label: str, theme: Theme, size: int = 13) -> st
 
 def _open(summary: Summary, theme: Theme, width: int, height: int) -> List[str]:
     """The svg tag, the background and the border."""
-    label = "AI usage over the last 30 days: %s tokens, %s API-equivalent" % (fmt_tokens(summary.total_tokens), fmt_cost(summary.total_cost_usd))
+    period = "over the last 6 months" if summary.full_window else "since " + fmt_date(summary.first_day)
+    label = "AI usage %s: %s tokens, %s API-equivalent" % (period, fmt_tokens(summary.total_tokens), fmt_cost(summary.total_cost_usd))
     return [
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d" role="img" aria-label="%s">'
         % (width, height, width, height, escape(label)),
@@ -154,7 +167,7 @@ def render(summary: Summary, theme: Theme) -> str:
     add = out.append
 
     # Header: label, updated date, the two headline numbers.
-    add(_text(28, 38, "AI USAGE · LAST 30 DAYS", 14, t.muted, weight=700, family=MONO, spacing=3))
+    add(_text(28, 38, "AI USAGE · " + period_label(summary), 14, t.muted, weight=700, family=MONO, spacing=3))
     add(_text(812, 38, "updated " + fmt_date(summary.updated), 14, t.muted, anchor="end"))
     add(_text(28, 88, fmt_tokens(summary.total_tokens), 46, t.text, weight=800))
     add(_text(28, 112, "tokens", 15, t.muted))
@@ -163,8 +176,8 @@ def render(summary: Summary, theme: Theme) -> str:
     add('<line x1="28" y1="128" x2="812" y2="128" stroke="%s" stroke-width="1"/>' % t.border)
 
     # Left column: daily tokens, then the split by tool.
-    peak = max([d.tokens for d in summary.daily] + [0])
-    add(_heading(28, 156, "TOKENS PER DAY", t))
+    peak = max([w.tokens for w in summary.weekly] + [0])
+    add(_heading(28, 156, "TOKENS PER WEEK", t))
     add(_text(400, 156, "peak " + fmt_tokens(peak), 13, t.muted, anchor="end"))
     out.extend(_chart(summary, t, 28, 236, 372, 64))
     add(_text(28, 258, fmt_day(summary.first_day), 13, t.muted))
@@ -194,7 +207,7 @@ def render_phone(summary: Summary, theme: Theme) -> str:
     cost = fmt_cost(summary.total_cost_usd)
     cost_size = 40 if len(cost) <= 8 else 32  # "$123,456" fits between x=200 and the 380 margin at 40; "$1,234,567" does not
 
-    add(_text(left, 38, "AI USAGE · LAST 30 DAYS", 15, t.muted, weight=700, family=MONO, spacing=2))
+    add(_text(left, 38, "AI USAGE · " + period_label(summary), 15, t.muted, weight=700, family=MONO, spacing=2))
     add(_text(left, 60, "updated " + fmt_date(summary.updated), 15, t.muted))
     add(_text(left, 112, fmt_tokens(summary.total_tokens), 40, t.text, weight=800))
     add(_text(left, 134, "tokens", 15, t.muted))
@@ -202,8 +215,8 @@ def render_phone(summary: Summary, theme: Theme) -> str:
     add(_text(200, 134, "API-equivalent", 15, t.muted))
     add('<line x1="%d" y1="150" x2="%d" y2="150" stroke="%s" stroke-width="1"/>' % (left, right, t.border))
 
-    peak = max([d.tokens for d in summary.daily] + [0])
-    add(_heading(left, 178, "TOKENS PER DAY", t, 15))
+    peak = max([w.tokens for w in summary.weekly] + [0])
+    add(_heading(left, 178, "TOKENS PER WEEK", t, 15))
     add(_text(right, 178, "peak " + fmt_tokens(peak), 15, t.muted, anchor="end"))
     out.extend(_chart(summary, t, left, 260, right - left, 66))
     add(_text(left, 284, fmt_day(summary.first_day), 15, t.muted))
