@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import re
 import subprocess
@@ -101,6 +102,23 @@ class LoadTests(Case):
         with self.assertRaises(CacheError):
             load_records(self.tmp / "u10")
 
+    def test_a_file_whose_version_field_differs_from_its_name_is_refused(self):
+        fx.write_userdata(self.tmp / "u9", scan=fx.scan_cache(version=5), scan_version=9)
+        with self.assertRaisesRegex(CacheError, "unsupported scan cache version: 5"):
+            load_records(self.tmp / "u9")
+
+    def test_odd_cache_file_names_are_ignored_not_a_crash(self):
+        for name in ("usage-scan-cache-v\u00b2.json", "usage-scan-cache-v010.json", "usage-scan-cache-vx.json"):
+            (self.userdata / name).write_text("{}")
+        self.assertTrue(load_records(self.userdata))
+
+    def test_only_an_older_cache_file_says_the_current_one_is_missing(self):
+        (self.userdata / "usage-scan-cache-v5.json").rename(self.userdata / "usage-scan-cache-v4.json")
+        with self.assertRaises(CacheError) as caught:
+            load_records(self.userdata)
+        self.assertIn("cache file is missing: usage-scan-cache-v9.json", str(caught.exception))
+        self.assertNotIn("now writes", str(caught.exception))
+
     def test_files_with_a_read_position_t3_rejects_are_skipped(self):
         scan = fx.scan_cache()
         scan["files"]["/f/e.jsonl"]["gl"] = 2000  # longer than the offset `o`
@@ -165,9 +183,17 @@ class ClaudeTranscriptTests(Case):
         for target in (self.projects / "-proj-a" / "chat1" / "subagents", self.projects / "-proj-a" / "chat2.jsonl"):
             os.chmod(str(target), 0)
             self.addCleanup(os.chmod, str(target), 0o755)
-            with self.assertRaisesRegex(CacheError, "cannot be read \\(PermissionError\\)"):
-                self.claude()
+            with self.assertRaisesRegex(CacheError, "cannot be read \\(PermissionError\\)$"):
+                self.claude()  # EACCES is file permissions, so no Full Disk Access hint
             os.chmod(str(target), 0o755)
+
+    def test_only_a_macos_privacy_block_gets_the_full_disk_access_hint(self):
+        def blocked_walk(top, onerror=None, followlinks=False):
+            onerror(PermissionError(errno.EPERM, "Operation not permitted"))  # what macOS privacy gives
+            return iter(())
+        with mock.patch("ai_usage_card.claude.os.walk", side_effect=blocked_walk):
+            with self.assertRaisesRegex(CacheError, "Full Disk Access"):
+                self.claude()
 
     def test_a_copy_without_a_request_id_is_still_the_same_reply(self):
         fx.write_lines(self.projects / "-proj-b" / "fork.jsonl", [

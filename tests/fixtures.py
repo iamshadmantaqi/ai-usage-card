@@ -61,8 +61,10 @@ def scan_cache_v9():
     cache = scan_cache(version=9)
     for file_entry in cache["files"].values():
         file_entry["mr"] = 0
+    cache["files"]["/f/a.jsonl"]["r"] = [r + ["turn-%d" % n] for n, r in enumerate([A1, A2, A3, A4, A5])]
+    cache["files"]["/f/b.jsonl"]["r"] = [A1 + ["turn-0"], B1 + [None]]
     cache["files"]["/f/c.jsonl"]["r"] = [CODEX + ["turn-1"]]
-    cache["files"]["/f/d.jsonl"]["r"] = [CODEX + ["turn-1"]]
+    cache["files"]["/f/d.jsonl"]["r"] = [CODEX + ["turn-1"]]  # grok's rows stay twelve wide, as T3 mixes both
     return cache
 
 
