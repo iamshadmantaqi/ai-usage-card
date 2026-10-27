@@ -42,9 +42,9 @@ E1 = row(ms(10, 15, 9), "mystery-model", 2, 1000, 0, 0, 1000)  # 2000 tokens, un
 E2 = [row(ms(10, 15, 10), "tiny-%d" % n, 2, n, 0, 0, 0) for n in (1, 2, 3)]  # 1, 2 and 3 tokens
 
 
-def scan_cache():
+def scan_cache(version=5):
     return {
-        "sources": {}, "version": 5, "models": MODELS, "sessions": SESSIONS,
+        "sources": {}, "version": version, "models": MODELS, "sessions": SESSIONS,
         "files": {
             "/f/a.jsonl": entry("claude", [A1, A2, A3, A4, A5]),
             "/f/b.jsonl": entry("claude", [A1, B1]),  # a fork that copied A1 forward
@@ -53,6 +53,19 @@ def scan_cache():
             "/f/e.jsonl": entry("grok", [E1] + E2),
         },
     }
+
+
+def scan_cache_v9():
+    """The layout T3 writes from version 7: `mr` on every file and, on a row, a thirteenth field
+    (a service tier turn id, a string) after the rate model. Same usage figures as `scan_cache()`."""
+    cache = scan_cache(version=9)
+    for file_entry in cache["files"].values():
+        file_entry["mr"] = 0
+    cache["files"]["/f/a.jsonl"]["r"] = [r + ["turn-%d" % n] for n, r in enumerate([A1, A2, A3, A4, A5])]
+    cache["files"]["/f/b.jsonl"]["r"] = [A1 + ["turn-0"], B1 + [None]]
+    cache["files"]["/f/c.jsonl"]["r"] = [CODEX + ["turn-1"]]
+    cache["files"]["/f/d.jsonl"]["r"] = [CODEX + ["turn-1"]]  # grok's rows stay twelve wide, as T3 mixes both
+    return cache
 
 
 def cursor_cache():
@@ -76,10 +89,10 @@ def rates():
     }}
 
 
-def write_userdata(folder: Path, scan=None, cursor=None, rate_table=None, cursor_enabled=True) -> Path:
+def write_userdata(folder: Path, scan=None, cursor=None, rate_table=None, cursor_enabled=True, scan_version=5) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "settings.json").write_text(json.dumps({"cursorKeychainUsageEnabled": cursor_enabled}))
-    (folder / "usage-scan-cache-v5.json").write_text(json.dumps(scan if scan is not None else scan_cache()))
+    (folder / ("usage-scan-cache-v%d.json" % scan_version)).write_text(json.dumps(scan if scan is not None else scan_cache(scan_version)))
     (folder / "usage-cursor-account-cache-v1.json").write_text(json.dumps(cursor if cursor is not None else cursor_cache()))
     (folder / "usage-model-rates.json").write_text(json.dumps(rate_table if rate_table is not None else rates()))
     return folder

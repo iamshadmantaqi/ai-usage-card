@@ -12,6 +12,7 @@ leaves this module (ids are used to de-duplicate and are not stored on the recor
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -45,7 +46,13 @@ def _count(value: Any) -> int:
 
 def _unreadable(error: OSError) -> None:
     # A folder that cannot be listed would drop its usage from the card without a trace.
-    raise CacheError("a Claude Code transcripts folder cannot be read (%s)" % type(error).__name__)
+    hint = ""
+    if error.errno == errno.EPERM:
+        # ~/.claude/projects can sit on an external drive, and macOS blocks a launchd job from those
+        # until the job's python is allowed in System Settings > Privacy & Security. That block is
+        # EPERM; EACCES is ordinary file permissions, where Full Disk Access would not help.
+        hint = ": macOS may be blocking this job from the drive (Privacy & Security, Full Disk Access)"
+    raise CacheError("a Claude Code transcripts folder cannot be read (%s)%s" % (type(error).__name__, hint))
 
 
 def transcript_files(roots: Iterable[Path], min_mtime_ms: float = 0) -> Iterator[str]:

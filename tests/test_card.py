@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import re
 import subprocess
@@ -71,14 +72,52 @@ class LoadTests(Case):
         self.assertEqual([r.dedupe_key for r in load_records(self.userdata) if r.provider == "cursor"],
                          ["cursor-account:k:1:0"])
 
-    def test_a_newer_cache_version_beside_ours_is_refused(self):
-        for name in ("usage-scan-cache-v6.json", "usage-cursor-account-cache-v2.json"):
+    def test_reads_a_version_9_cache_the_way_it_reads_version_5(self):
+        v5 = sorted((r.provider, r.model, r.tokens.total) for r in load_records(self.userdata))
+        v9 = fx.write_userdata(self.tmp / "userdata9", scan=fx.scan_cache_v9(), scan_version=9)
+        self.assertEqual(sorted((r.provider, r.model, r.tokens.total) for r in load_records(v9)), v5)
+        self.assertIn(("codex", "gpt-6-luna", 350), v5)
+
+    def test_the_newest_supported_cache_file_is_the_one_read(self):
+        # v5 still holds A1's 10000 tokens; the v9 file, written later by T3, has none of the Claude files.
+        scan = fx.scan_cache_v9()
+        scan["files"] = {k: v for k, v in scan["files"].items() if v["p"] != "claude"}
+        fx.write_userdata(self.userdata, scan=scan, scan_version=9)
+        self.assertEqual({r.provider for r in load_records(self.userdata)}, {"codex", "grok", "cursor"})
+
+    def test_a_cache_version_newer_than_the_ones_checked_is_refused(self):
+        for name in ("usage-scan-cache-v10.json", "usage-cursor-account-cache-v2.json"):
             (self.userdata / name).write_text("{}")
-            with self.assertRaises(CacheError, msg=name):
+            with self.assertRaises(CacheError, msg=name) as caught:
                 load_records(self.userdata)
+            self.assertIn("T3 Code now writes " + name, str(caught.exception))
             (self.userdata / name).unlink()
         (self.userdata / "usage-scan-cache-v4.json").write_text("{}")  # an older one left behind is fine
         load_records(self.userdata)
+
+    def test_a_file_whose_version_field_is_not_a_supported_one_is_refused(self):
+        scan = fx.scan_cache_v9()
+        scan["version"] = 10
+        fx.write_userdata(self.tmp / "u10", scan=scan, scan_version=9)
+        with self.assertRaises(CacheError):
+            load_records(self.tmp / "u10")
+
+    def test_a_file_whose_version_field_differs_from_its_name_is_refused(self):
+        fx.write_userdata(self.tmp / "u9", scan=fx.scan_cache(version=5), scan_version=9)
+        with self.assertRaisesRegex(CacheError, "unsupported scan cache version: 5"):
+            load_records(self.tmp / "u9")
+
+    def test_odd_cache_file_names_are_ignored_not_a_crash(self):
+        for name in ("usage-scan-cache-v\u00b2.json", "usage-scan-cache-v010.json", "usage-scan-cache-vx.json"):
+            (self.userdata / name).write_text("{}")
+        self.assertTrue(load_records(self.userdata))
+
+    def test_only_an_older_cache_file_says_the_current_one_is_missing(self):
+        (self.userdata / "usage-scan-cache-v5.json").rename(self.userdata / "usage-scan-cache-v4.json")
+        with self.assertRaises(CacheError) as caught:
+            load_records(self.userdata)
+        self.assertIn("cache file is missing: usage-scan-cache-v9.json", str(caught.exception))
+        self.assertNotIn("now writes", str(caught.exception))
 
     def test_files_with_a_read_position_t3_rejects_are_skipped(self):
         scan = fx.scan_cache()
@@ -144,9 +183,17 @@ class ClaudeTranscriptTests(Case):
         for target in (self.projects / "-proj-a" / "chat1" / "subagents", self.projects / "-proj-a" / "chat2.jsonl"):
             os.chmod(str(target), 0)
             self.addCleanup(os.chmod, str(target), 0o755)
-            with self.assertRaisesRegex(CacheError, "cannot be read \\(PermissionError\\)"):
-                self.claude()
+            with self.assertRaisesRegex(CacheError, "cannot be read \\(PermissionError\\)$"):
+                self.claude()  # EACCES is file permissions, so no Full Disk Access hint
             os.chmod(str(target), 0o755)
+
+    def test_only_a_macos_privacy_block_gets_the_full_disk_access_hint(self):
+        def blocked_walk(top, onerror=None, followlinks=False):
+            onerror(PermissionError(errno.EPERM, "Operation not permitted"))  # what macOS privacy gives
+            return iter(())
+        with mock.patch("ai_usage_card.claude.os.walk", side_effect=blocked_walk):
+            with self.assertRaisesRegex(CacheError, "Full Disk Access"):
+                self.claude()
 
     def test_a_copy_without_a_request_id_is_still_the_same_reply(self):
         fx.write_lines(self.projects / "-proj-b" / "fork.jsonl", [
@@ -463,9 +510,17 @@ class CliTests(Case):
             self.assertFalse(out.exists())
         self.assertIn("PrivacyError", (self.tmp / "card.log").read_text())
 
+    def test_a_blocked_transcripts_folder_refuses_and_names_the_macos_privacy_setting(self):
+        denied = PermissionError(1, "Operation not permitted")
+        with mock.patch("ai_usage_card.claude.os.walk", side_effect=lambda root, onerror, **kw: onerror(denied)):
+            self.assertEqual(self.run_cli("--out", str(self.tmp / "out")), 1)
+        log = (self.tmp / "card.log").read_text()
+        self.assertIn("cannot be read (PermissionError): macOS may be blocking this job from the drive", log)
+        self.assertFalse((self.tmp / "out").exists())
+
     def test_refuses_an_unsupported_cache_version(self):
         scan = fx.scan_cache()
-        scan["version"] = 6
+        scan["version"] = 10
         fx.write_userdata(self.userdata, scan=scan)
         self.assertEqual(self.run_cli("--out", str(self.tmp / "out")), 1)
         self.assertIn("unsupported scan cache version", (self.tmp / "card.log").read_text())
