@@ -37,4 +37,4 @@ def check_privacy(text: str) -> None:
 
 def safe_label(label: str) -> bool:
     """True for a plain model or tool name: the only kind that may reach the card or the history file."""
-    return bool(_SAFE_LABEL.match(label)) and not looks_private(label)
+    return bool(_SAFE_LABEL.fullmatch(label)) and not looks_private(label)

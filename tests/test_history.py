@@ -77,7 +77,11 @@ class FreezeTests(Base):
         records = self.records()
         self.assertEqual(sorted(freeze(records, {}, TODAY, Ledger.empty(), through=date(2026, 9, 10)).days),
                          [date(2026, 8, 31), date(2026, 9, 10)])
-        self.assertEqual(freeze(records, {}, TODAY, Ledger.empty(), through=None), Ledger.empty())
+        # Without T3 Code's caches, only days 50 or more days old (on or before 8 Sep) are frozen: Claude Code's
+        # cleanup at 60 days would take them otherwise.
+        self.assertEqual(freeze(records, {}, TODAY, Ledger.empty(), through=None), Ledger(
+            {date(2026, 8, 31): [row("claude", OPUS, 10, 0.1)]}, date(2026, 8, 31)))
+        self.assertEqual(sorted(freeze(records, {}, TODAY, Ledger.empty(), through=date(2026, 8, 1)).days), [date(2026, 8, 31)])
 
     def test_names_that_are_not_plain_are_frozen_as_other(self):
         records = [rec(at(8, 31, 1), 1, 0.0), rec(at(9, 1, 9), 3, 0.0, "/Users/x/tool", "stealth/ox-alpha"),
@@ -86,55 +90,89 @@ class FreezeTests(Base):
         self.assertEqual(frozen.days[date(2026, 9, 1)], [row("other", "other", 3, 0.0)])
         self.assertNotIn("Users", history.dump(frozen))
 
+    def test_a_negative_or_infinite_sum_is_frozen_as_zero_so_the_file_still_reads(self):
+        records = [rec(at(9, 1, 9), 5, -0.25, "cursor", "cursor-auto"), rec(at(9, 1, 1), 3, float("inf"))]
+        frozen = freeze(records, {}, TODAY, Ledger.empty(), through=TODAY)
+        self.assertEqual(frozen.days[date(2026, 9, 1)], [row("claude", OPUS, 3, 0.0), row("cursor", "cursor-auto", 5, 0.0)])
+        history.save(self.tmp / "history.json", frozen)
+        self.assertEqual(history.load(self.tmp / "history.json"), frozen)
+
+    def test_a_ledger_the_reader_would_refuse_is_never_written(self):
+        path = self.tmp / "history.json"
+        for bad in (Row("claude", OPUS, -1, 0.0), Row("claude", OPUS, 1, float("nan")), Row("claude", OPUS, 1, float("inf"))):
+            with self.subTest(bad):
+                with self.assertRaises(LedgerError):
+                    history.save(path, Ledger({date(2026, 9, 1): [bad]}))
+                self.assertEqual(list(self.tmp.iterdir()), [])
+
     def test_cursors_default_model_is_frozen_under_its_display_name(self):
         frozen = freeze([rec(at(8, 31, 1), 1, 0.0), rec(at(9, 1, 9), 3, 0.5, "cursor", "default")], {}, TODAY, Ledger.empty(), through=TODAY)
         self.assertEqual(frozen.days[date(2026, 9, 1)], [row("cursor", "cursor-auto", 3, 0.5)])
 
 
 class PartialFirstDayTests(Base):
+    # The cleanup point for TODAY is 30 Aug (today - 59 days): these first days all fall after it.
     def test_the_oldest_day_is_skipped_when_its_first_record_is_at_or_after_0200(self):
-        records = [rec(at(8, 28, 15), 999, 9.0), rec(at(8, 29, 9), 20, 0.2), rec(at(9, 1, 9), 30, 0.3)]
-        self.assertEqual(cut_off_day(records, Ledger.empty(), TODAY), date(2026, 8, 28))
+        records = [rec(at(9, 1, 15), 999, 9.0), rec(at(9, 2, 9), 20, 0.2), rec(at(9, 5, 9), 30, 0.3)]
+        self.assertEqual(cut_off_day(records, Ledger.empty(), TODAY), date(2026, 9, 1))
         frozen = freeze(records, {}, TODAY, Ledger.empty(), through=TODAY)
-        self.assertEqual(sorted(frozen.days), [date(2026, 8, 29), date(2026, 9, 1)])
+        self.assertEqual((sorted(frozen.days), frozen.start), ([date(2026, 9, 2), date(2026, 9, 5)], date(2026, 9, 2)))
         s = summarise(records, {}, TODAY, ledger=frozen)
-        self.assertEqual((s.first_day, s.total_tokens), (date(2026, 8, 29), 50))  # not 1049
+        self.assertEqual((s.first_day, s.total_tokens), (date(2026, 9, 2), 50))  # not 1049
 
     def test_the_first_full_day_is_the_day_after_the_cut_off_one_even_with_no_usage_on_it(self):
-        records = [rec(at(8, 28, 15), 999, 9.0), rec(at(9, 1, 9), 30, 0.3)]
+        records = [rec(at(9, 1, 15), 999, 9.0), rec(at(9, 5, 9), 30, 0.3)]
         s = summarise(records, {}, TODAY)
-        self.assertEqual((s.first_day, s.total_tokens, s.daily[0].tokens), (date(2026, 8, 29), 30, 0))
+        self.assertEqual((s.first_day, s.total_tokens, s.daily[0].tokens), (date(2026, 9, 2), 30, 0))
+
+    def test_the_first_full_day_is_saved_so_it_holds_once_the_cut_off_day_is_deleted(self):
+        records = [rec(at(9, 1, 15), 999, 9.0), rec(at(9, 5, 9), 30, 0.3)]
+        frozen = freeze(records, {}, TODAY, Ledger.empty(), through=TODAY)
+        self.assertEqual((sorted(frozen.days), frozen.start), ([date(2026, 9, 5)], date(2026, 9, 2)))
+        later = date(2026, 10, 29)  # 1 Sep's transcript is gone: the live data now starts on 5 Sep
+        self.assertEqual(summarise(records[1:], {}, later, ledger=history.parse(history.dump(frozen))).first_day, date(2026, 9, 2))
+        self.assertEqual(summarise(records[1:], {}, later).first_day, date(2026, 9, 6))  # without the saved start it moves
 
     def test_a_first_record_before_0200_is_a_full_day(self):
-        records = [rec(at(8, 28, 1, 59), 11, 0.1), rec(at(9, 1, 9), 30, 0.3)]
+        records = [rec(at(9, 1, 1, 59), 11, 0.1), rec(at(9, 5, 9), 30, 0.3)]
         self.assertIsNone(cut_off_day(records, Ledger.empty(), TODAY))
-        self.assertEqual(summarise(records, {}, TODAY).first_day, date(2026, 8, 28))
-        self.assertEqual(cut_off_day([rec(at(8, 28, 2, 0), 11, 0.1)], Ledger.empty(), TODAY), date(2026, 8, 28))
+        self.assertEqual(summarise(records, {}, TODAY).first_day, date(2026, 9, 1))
+        self.assertEqual(cut_off_day([rec(at(9, 1, 2, 0), 11, 0.1)], Ledger.empty(), TODAY), date(2026, 9, 1))
 
     def test_a_young_oldest_day_is_a_real_start_and_a_day_the_history_has_is_never_cut_off(self):
         young = [rec(at(10, 20, 15), 5, 0.1)]
         self.assertIsNone(cut_off_day(young, Ledger.empty(), TODAY))
         self.assertEqual(summarise(young, {}, TODAY).first_day, date(2026, 10, 20))
-        old = [rec(at(8, 28, 15), 5, 0.1)]
-        self.assertIsNone(cut_off_day(old, ledger_of(d0828=[row("claude", OPUS, 5, 0.1)]), TODAY))
-        self.assertIsNone(cut_off_day(old, ledger_of(d0827=[row("claude", OPUS, 5, 0.1)]), TODAY))
+        old = [rec(at(9, 1, 15), 5, 0.1)]
+        self.assertIsNone(cut_off_day(old, ledger_of(d0901=[row("claude", OPUS, 5, 0.1)]), TODAY))
+        self.assertIsNone(cut_off_day(old, ledger_of(d0831=[row("claude", OPUS, 5, 0.1)]), TODAY))
+        self.assertIsNone(cut_off_day(old, Ledger({}, date(2026, 9, 3)), TODAY))
+
+    def test_records_before_the_cleanup_point_do_not_start_the_history(self):
+        # A resumed transcript keeps a lone 1 Aug message; the files of 2 Aug to 29 Aug may be gone, so 30 Aug starts.
+        records = [rec(at(8, 1, 9), 7, 0.07), rec(at(8, 29, 9), 3, 0.03), rec(at(9, 4, 9), 30, 0.3),
+                   rec(at(6, 1, 1), 50, 0.5, "codex", "gpt-6-luna")]  # Codex keeps its files: it cannot pull the start back either
+        frozen = freeze(records, {}, TODAY, Ledger.empty(), through=TODAY)
+        self.assertEqual((sorted(frozen.days), frozen.start), ([date(2026, 9, 4)], date(2026, 8, 30)))
+        s = summarise(records, {}, TODAY, ledger=frozen)
+        self.assertEqual((s.first_day, s.total_tokens), (date(2026, 8, 30), 30))
 
 
 class LongHistoryToolTests(Base):
     def test_cursor_days_before_the_file_based_tools_start_do_not_move_the_start(self):
-        records = [rec(at(8, 17, 10), 999, 9.0, "cursor", "cursor-auto"),   # Cursor's server keeps more than the 60-day files
-                   rec(at(8, 27, 15), 888, 8.0),                              # Claude Code's oldest day: cut off
-                   rec(at(8, 28, 9), 20, 0.2), rec(at(8, 28, 10), 5, 0.05, "cursor", "cursor-auto")]
-        self.assertEqual(cut_off_day(records, Ledger.empty(), TODAY), date(2026, 8, 27))
+        records = [rec(at(8, 31, 10), 999, 9.0, "cursor", "cursor-auto"),   # Cursor's server keeps more than the 60-day files
+                   rec(at(9, 1, 15), 888, 8.0),                              # Claude Code's oldest day: cut off
+                   rec(at(9, 2, 9), 20, 0.2), rec(at(9, 2, 10), 5, 0.05, "cursor", "cursor-auto")]
+        self.assertEqual(cut_off_day(records, Ledger.empty(), TODAY), date(2026, 9, 1))
         frozen = freeze(records, {}, TODAY, Ledger.empty(), through=TODAY)
-        self.assertEqual(sorted(frozen.days), [date(2026, 8, 28)])
+        self.assertEqual(sorted(frozen.days), [date(2026, 9, 2)])
         s = summarise(records, {}, TODAY, ledger=frozen)
         self.assertEqual((s.first_day, s.total_tokens, [(t.label, t.tokens) for t in s.tools]),
-                         (date(2026, 8, 28), 25, [("Claude Code", 20), ("Cursor", 5)]))
+                         (date(2026, 9, 2), 25, [("Claude Code", 20), ("Cursor", 5)]))
 
-    def test_with_only_cursor_data_it_sets_the_start_itself(self):
-        records = [rec(at(8, 17, 1), 7, 0.1, "cursor", "cursor-auto")]
-        self.assertEqual(summarise(records, {}, TODAY).first_day, date(2026, 8, 17))
+    def test_with_only_cursor_data_it_sets_the_start_itself_but_not_before_the_cleanup_point(self):
+        self.assertEqual(summarise([rec(at(9, 3, 1), 7, 0.1, "cursor", "cursor-auto")], {}, TODAY).first_day, date(2026, 9, 3))
+        self.assertEqual(summarise([rec(at(8, 17, 1), 7, 0.1, "cursor", "cursor-auto")], {}, TODAY).first_day, date(2026, 8, 30))
 
 
 class WindowTests(Base):
@@ -289,6 +327,12 @@ class LedgerFileTests(Base):
             "string cost": json.dumps({"version": 1, "days": {"2026-08-28": [dict(row_ok, cost_usd="1")]}}),
             "a path as the model": json.dumps({"version": 1, "days": {"2026-08-28": [dict(row_ok, model="/Users/x/secret")]}}),
             "an id as the tool": json.dumps({"version": 1, "days": {"2026-08-28": [dict(row_ok, tool="msg_abc")]}}),
+            "a name ending in a newline": json.dumps({"version": 1, "days": {"2026-08-28": [dict(row_ok, model="gpt-6\n")]}}),
+            "a huge integer cost": '{"version": 1, "days": {"2026-08-28": [{"tool": "claude", "model": "m", "tokens": 1, "cost_usd": 1%s}]}}' % ("0" * 400),
+            "huge tokens": json.dumps({"version": 1, "days": {"2026-08-28": [dict(row_ok, tokens=2 ** 60)]}}),
+            "infinite cost": '{"version": 1, "days": {"2026-08-28": [{"tool": "claude", "model": "m", "tokens": 1, "cost_usd": Infinity}]}}',
+            "bad start": json.dumps({"version": 1, "start": "soon", "days": {}}),
+            "a day before the start": json.dumps({"version": 1, "start": "2026-08-29", "days": {"2026-08-28": [row_ok]}}),
         }
         for name, text in bad.items():
             with self.subTest(name):
@@ -308,7 +352,8 @@ class CliHistoryTests(Base):
         super().setUp()
         self.userdata = fx.write_userdata(self.tmp / "userdata")
         self.projects = fx.write_projects(self.tmp / "projects")
-        # Sep 4, 10:00 Dhaka: 100 + 20 tokens, 100 * 1e-6 + 20 * 5e-6 = $0.0002. The 1 Aug transcript is the cut-off oldest day.
+        # Sep 4, 10:00 Dhaka: 100 + 20 tokens, 100 * 1e-6 + 20 * 5e-6 = $0.0002. The 1 Aug transcript is older than the
+        # cleanup point (18 Oct - 59 days = 20 Aug), so the history starts on 20 Aug.
         fx.write_lines(self.projects / "-proj-a" / "chat9.jsonl", [fx.reply(OPUS, (9, 4, 4), fx.usage(100, 20), msg="msg_h", req="req_h")])
         self.history = self.tmp / "state" / "history.json"
         self.out = self.tmp / "out"
@@ -327,19 +372,19 @@ class CliHistoryTests(Base):
         self.assertFalse(self.history.exists())  # a missing ledger starts fresh
         self.assertEqual(self.run_cli("--out", str(self.out), "--history", str(self.history)), 0)
         first = self.history.read_bytes()
-        self.assertEqual(json.loads(first), {"version": 1, "days": {"2026-09-04": [
-            {"tool": "claude", "model": OPUS, "tokens": 120, "cost_usd": 0.0002}]}})  # 1 Aug is cut off, 1 Sep is T3's Claude copy (ignored)
+        self.assertEqual(json.loads(first), {"version": 1, "start": "2026-08-20", "days": {"2026-09-04": [
+            {"tool": "claude", "model": OPUS, "tokens": 120, "cost_usd": 0.0002}]}})  # 1 Aug is before the start, 1 Sep is T3's Claude copy (ignored)
         self.assertIn("saved 1 new days", self.log())
         cards = {p.name: p.read_bytes() for p in self.out.iterdir()}
         self.assertEqual(self.run_cli("--out", str(self.out), "--history", str(self.history)), 0)
         self.assertEqual(self.history.read_bytes(), first)
         self.assertEqual({p.name: p.read_bytes() for p in self.out.iterdir()}, cards)
         self.assertEqual([p.name for p in self.history.parent.iterdir()], ["history.json"])
-        self.assertIn("AI USAGE · SINCE 2 AUG 2026", cards["ai-usage-dark.svg"].decode())  # the day after the cut-off 1 Aug
+        self.assertIn("AI USAGE · SINCE 20 AUG 2026", cards["ai-usage-dark.svg"].decode())  # the cleanup point, not the lone 1 Aug
 
     def test_the_log_line_names_the_period_weeks_and_history(self):
         self.run_cli("--out", str(self.out), "--history", str(self.history))
-        self.assertRegex(self.log(), r"since 2 aug 2026: 11\.5K tokens, \$0\.03 API-equivalent, 12 weeks, updated 2026-10-18; "
+        self.assertRegex(self.log(), r"since 20 aug 2026: 11\.5K tokens, \$0\.03 API-equivalent, 9 weeks, updated 2026-10-18; "
                                      r"history holds 1 days \(1 frozen this run\)")
 
     def test_a_trial_run_with_out_does_not_save_unless_history_is_given(self):
@@ -361,9 +406,9 @@ class CliHistoryTests(Base):
         saved = ledger_of(d0904=[row("claude", OPUS, 5, 0.5)])
         history.save(self.history, saved)
         self.assertEqual(self.run_cli("--out", str(self.out), "--history", str(self.history)), 0)
-        self.assertEqual(history.load(self.history), saved)  # live says 120 tokens; the frozen 5 stays
+        self.assertEqual(history.load(self.history), Ledger(saved.days, date(2026, 8, 20)))  # live says 120 tokens; the frozen 5 stays
         # T3's other tools 5856 + Claude Code 5570 + the saved 5 = 11431 tokens; $0.5 + 0.032005 (without the 0.0002 for the live 120)
-        self.assertIn('aria-label="AI usage since 2 Aug 2026: 11.4K tokens, $0.53 API-equivalent"', (self.out / "ai-usage-dark.svg").read_text())
+        self.assertIn('aria-label="AI usage since 20 Aug 2026: 11.4K tokens, $0.53 API-equivalent"', (self.out / "ai-usage-dark.svg").read_text())
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ from .pricing import load_rates
 from .privacy import PrivacyError, check_privacy
 from .history import Ledger, LedgerError
 from .render import DARK, LIGHT, fmt_cost, fmt_tokens, period_label, render, render_phone
-from .summarise import TIMEZONE, freeze, local_day, summarise, window_start_ms
+from .summarise import TIMEZONE, freeze, last_frozen_day, local_day, summarise, window_start_ms
 
 HOME = Path.home()
 DEFAULT_USERDATA = HOME / ".t3" / "userdata"
@@ -40,7 +40,9 @@ class Refused(Exception):
 
 
 def gather(userdata: Path, projects: Path, now: datetime) -> Tuple[List[UsageRecord], Optional[int]]:
-    """Records for the window, and the timestamp of T3 Code's newest record (None if it has none).
+    """Records for the window, and the time both of T3 Code's caches are complete up to (None if they cover
+    nothing): the older of the scan cache's newest record and Cursor's `untilMs`, so one fresh cache cannot hide
+    the other being stale.
 
     Claude Code comes from its own transcripts (see `claude.py`), read from `projects` and from every
     Claude folder T3 scans; T3's Claude records are dropped so nothing is counted twice. Everything
@@ -50,9 +52,10 @@ def gather(userdata: Path, projects: Path, now: datetime) -> Tuple[List[UsageRec
     floor_ms = window_start_ms(now.astimezone(TIMEZONE).date()) - FILE_SLACK_MS
     # A timestamp in the future (clock skew, a bad row) would defeat the age check in build_cards.
     in_range = lambda r: floor_ms <= r.timestamp_ms <= now_ms
-    t3_records, t3_claude_folders = load_t3(userdata, floor_ms)
+    t3_records, t3_claude_folders, cursor_until = load_t3(userdata, floor_ms)
     t3 = [r for r in t3_records if in_range(r)]
-    t3_newest = max((r.timestamp_ms for r in t3), default=None)
+    scan_newest = max((r.timestamp_ms for r in t3 if r.provider != "cursor"), default=None)
+    t3_newest = scan_newest if cursor_until is None or scan_newest is None else min(scan_newest, cursor_until)
     claude = [r for r in load_claude_records([projects] + [Path(f) for f in t3_claude_folders], floor_ms) if in_range(r)]
     if not claude and any(r.provider == "claude" for r in t3):
         raise Refused("T3 Code has Claude Code usage in the window but its transcripts gave none")
@@ -81,14 +84,16 @@ def build(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: 
         raise Refused("newest record is %.0f hours old (limit %d): no source has recent usage"
                       % ((now_ms - newest_ms) / 3.6e6, MAX_RECORD_AGE.total_seconds() / 3600))
     if t3_newest is None or now_ms - t3_newest > max_age_ms:
-        log.warning("T3 Code's newest record is %s: Cursor, Codex and other tools may be missing recent days"
+        log.warning("T3 Code's caches are %s: Cursor, Codex and other tools may be missing recent days"
                     " (open its usage page)", "missing" if t3_newest is None else "%.0f hours old" % ((now_ms - t3_newest) / 3.6e6))
     ledger = ledger or Ledger.empty()
     rates, today = load_rates(userdata), now.astimezone(TIMEZONE).date()
-    # A day is frozen only when T3 Code's cache reaches past it: that cache is saved when its usage page is open.
+    # A day is frozen once T3 Code's caches reach past it (they are saved when its usage page is open), or once it
+    # is old enough that Claude Code's cleanup would otherwise take its transcripts first.
     through = local_day(t3_newest) - timedelta(days=1) if t3_newest is not None else None
-    if through is None:
-        log.warning("T3 Code has no records in the window: no day is frozen into the history this run")
+    if through is None or through < last_frozen_day(today, through):
+        log.warning("T3 Code's caches end %s: days from %s on are frozen without waiting for them",
+                    "nowhere in the window" if through is None else through.isoformat(), last_frozen_day(today, through).isoformat())
     frozen = freeze(records, rates, today, ledger, through)
     summary = summarise(records, rates, today, newest_ms, frozen)
     cards = {"ai-usage-light.svg": render(summary, LIGHT), "ai-usage-dark.svg": render(summary, DARK),
@@ -123,11 +128,6 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
         saved = ledger_file.load(history_path)  # a corrupt file refuses the run here, before anything can overwrite it
         cards, frozen = build(args.userdata, now or datetime.now(TIMEZONE), args.claude_projects, saved)
         added = len(frozen.days) - len(saved.days)
-        if added and args.out and not args.history:
-            log.info("trial run: %d new days not saved to %s (pass --history to save them)", added, history_path)
-        elif added:
-            ledger_file.save(history_path, frozen)
-            log.info("saved %d new days to %s", added, history_path)
         if args.out:
             args.out.mkdir(parents=True, exist_ok=True)
             for name, svg in cards.items():
@@ -137,6 +137,16 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
             log.info("published a new card to branch %s", publisher.BRANCH)
         else:
             log.info("card unchanged, nothing committed")
+        # Saved after the card is out, so a history that cannot be written does not hold the card back; the days
+        # it would have added are still live, and the next run saves them.
+        if frozen != saved and args.out and not args.history:
+            log.info("trial run: %d new days not saved to %s (pass --history to save them)", added, history_path)
+        elif frozen != saved:
+            try:
+                ledger_file.save(history_path, frozen)
+            except OSError as error:
+                raise LedgerError("history file %s cannot be written (%s: %s)" % (history_path, type(error).__name__, error))
+            log.info("saved %d new days to %s", added, history_path)
         return 0
     except (Refused, CacheError, PrivacyError, LedgerError, publisher.PublishError) as error:
         log.error("refused: %s: %s", type(error).__name__, error)

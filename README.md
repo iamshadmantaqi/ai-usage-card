@@ -9,20 +9,20 @@ A self-updating SVG card of my AI usage over the last six months, shown on my [G
    Records are de-duplicated and priced the way T3 Code does, from its cached LiteLLM rate table. The T3 record layouts are documented in `ai_usage_card/load.py`.
 3. Claude Code deletes its transcripts after 60 days (`cleanupPeriodDays`) and T3 Code's cache follows them, so a six-month window cannot be read from them. The first run, and every run after, saves each day that is at least 30 days old to a local history file, once, and from then on reads that day from the file. Days under 30 days old always come from the live data. A day is counted from exactly one source, never both. See "History" below.
 4. It draws `ai-usage-light.svg`, `ai-usage-dark.svg`, `ai-usage-phone-light.svg` and `ai-usage-phone-dark.svg` and commits all four in one commit to the `usage-card` branch of the profile repo, only when the bytes of any changed.
-5. A launchd job on my Mac runs this daily at 06:00. It costs no AI tokens.
+5. A launchd job on my Mac runs this daily at 6:00 AM BD time. It costs no AI tokens.
 
 ## History and the window
 
-The card reads `AI USAGE · SINCE 28 AUG 2026` (the real first full day) until the history reaches back 182 days, then `AI USAGE · LAST 6 MONTHS`, a rolling window of 182 days ending today. The chart is `TOKENS PER WEEK`: weeks start on Monday in Dhaka time, the week that holds today is drawn faded because it is not finished, and a week clipped by the start of the window is drawn like any other. Dates use Asia/Dhaka.
+The card reads `AI USAGE · SINCE 30 AUG 2026` (the first full day) until the history reaches back 182 days, then `AI USAGE · LAST 6 MONTHS`, a rolling window of 182 days ending today. The chart is `TOKENS PER WEEK`: weeks start on Monday in Dhaka time, the week that holds today is drawn faded because it is not finished, and a week clipped by the start of the window is drawn like any other. Dates use Asia/Dhaka.
 
-The history is `~/Library/Application Support/ai-usage-card/history.json` (change it with `--history`). It lives outside the repo and is never published. It holds frozen days only:
+The history is `~/Library/Application Support/ai-usage-card/history.json` (change it with `--history`). It lives outside the repo and is never published. It holds the first full day and the frozen days only:
 
 ```json
-{"version": 1, "days": {"2026-08-28": [{"tool": "claude", "model": "claude-opus-5-5", "tokens": 123, "cost_usd": 4.5}]}}
+{"version": 1, "start": "2026-08-30", "days": {"2026-08-30": [{"tool": "claude", "model": "claude-opus-5-5", "tokens": 123, "cost_usd": 4.5}]}}
 ```
 
-- **Freezing.** A live day at least 30 days old is added once and never changed again (cost is the API-equivalent cost at the time). A day is frozen only when T3 Code's cache reaches past it, because T3 saves that cache only when its usage page is open and a stale one would freeze a day with Cursor, Codex or Grok missing. Writes go to a temporary file that is renamed over the old one, and a run that adds nothing writes nothing.
-- **First run.** Every live day at least 30 days old is frozen. The oldest day Claude Code still holds is cut off part way by the 60-day cleanup, so it is skipped when its first record is at or after 02:00 Dhaka, and the history starts the day after. Cursor's usage comes from Cursor's servers and reaches back further than the files, so its older days do not move the start and are left out.
+- **Freezing.** A live day at least 30 days old is added once and never changed again (cost is the API-equivalent cost at the time). A day is frozen only when both of T3 Code's caches (the scan cache and Cursor's account cache) reach past it, because T3 saves them only when its usage page is open and a stale one would freeze a day with Cursor, Codex or Grok missing. A day 50 days old is frozen anyway, since Claude Code's cleanup takes its transcripts at 60 (the log says so). Writes go to a temporary file that is renamed over the old one, the text is read back with the same checks first, and a run that adds nothing writes nothing. The history is saved after the card is published, so a history that cannot be written does not hold the card back.
+- **First run.** Every live day at least 30 days old is frozen, and the first full day is saved as the history's `start`, so it never moves. That day is never before the cleanup point (today minus 59 days): a resumed or forked transcript keeps older messages, but other files from those days may be gone. After that point, the oldest day Claude Code still holds is cut off part way, so it is skipped when its first record is at or after 2:00 AM BD time, and the history starts the day after. Cursor's usage comes from Cursor's servers and Codex keeps its files, so their older days do not move the start and are left out.
 - **A bad file.** A missing file starts a new history. A file that is not valid JSON, has another version, holds a day, a row or a number that does not fit the layout, or holds a tool or model name that is not a plain name refuses the run (exit 1, reason in the log) and is never overwritten.
 - **Trial runs.** With `--out` and no `--history` the history is read but not written, so a trial run (for example with another `--userdata`) cannot change the real file.
 

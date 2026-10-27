@@ -7,6 +7,7 @@ transcripts and T3 Code's caches). `freeze` copies live days into the history on
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
@@ -24,7 +25,13 @@ from .privacy import safe_label
 
 WINDOW_DAYS = 182  # six months, rolling, ending today
 FREEZE_AFTER_DAYS = 30  # a day this old or older is saved to the history and read from it from then on
-PARTIAL_AFTER_HOUR = 2  # the oldest day of the first run is cut off if its first record is at or after 02:00 Dhaka
+# Claude Code deletes transcripts 60 days after their last write. A day this old is frozen even when T3 Code's caches
+# have not caught up with it, since waiting longer would lose its Claude Code usage for good.
+FORCE_FREEZE_DAYS = 50
+PARTIAL_AFTER_HOUR = 2  # the oldest day of the first run is cut off if its first record is at or after 2:00 AM Dhaka
+# Claude Code's transcript cleanup (`cleanupPeriodDays`, 60 on this Mac). A transcript that was resumed or forked keeps
+# older messages past it, but a day before the cleanup point may have lost other files, so it is never a full day.
+CLEANUP_DAYS = 60
 TOP_MODELS = 6
 MAX_TOOLS = 4
 # Providers whose usage comes from their own servers (Cursor's account API), not from files that a cleanup deletes
@@ -132,7 +139,8 @@ def _top(totals: Dict[str, List[float]], limit: int, other_label: str) -> List[S
 
 
 def live_days(records: Iterable[UsageRecord], rates: Dict[str, ModelRates]) -> Dict[date, List[Row]]:
-    """The live records as one row per day, tool and model, priced, with names already filtered. These are the rows the history stores."""
+    """The live records as one row per day, tool and model, priced, with names already filtered. These are the rows
+    the history stores, so a negative or non-finite sum (a refund row, a bad rate) is stored as 0."""
     table = {}  # type: Dict[date, Dict[tuple, List[float]]]
     for record in records:
         if record.model in EXCLUDED_MODELS:
@@ -141,7 +149,8 @@ def live_days(records: Iterable[UsageRecord], rates: Dict[str, ModelRates]) -> D
             (_tool_key(record.provider), _model_label(record)), [0, 0.0])
         cell[0] += record.tokens.total
         cell[1] += price(rates, record)
-    return {day: [Row(tool, model, int(v[0]), v[1]) for (tool, model), v in sorted(cells.items())]
+    return {day: [Row(tool, model, max(0, int(v[0])), v[1] if math.isfinite(v[1]) and v[1] > 0 else 0.0)
+                  for (tool, model), v in sorted(cells.items())]
             for day, cells in table.items()}
 
 
@@ -157,16 +166,21 @@ def _anchor(records: Iterable[UsageRecord]) -> List[UsageRecord]:
     return [r for r in usable if r.provider not in LONG_HISTORY_PROVIDERS] or usable
 
 
+def first_complete_day(today: date) -> date:
+    """The oldest day the cleanup cannot have cut: every file with a record on it was written on or after it."""
+    return today - timedelta(days=CLEANUP_DAYS - 1)
+
+
 def cut_off_day(records: Iterable[UsageRecord], ledger: Ledger, today: date) -> Optional[date]:
     """The oldest live day when it is cut off part way, else None.
 
     Claude Code deletes a transcript 60 days after its last write, so the oldest day it still holds
     keeps only the files written after the cut. That day is told by its first record: at or after
-    02:00 Dhaka means the morning is missing. The test only applies to the first run, when the history
-    has no day on or before it, and only to a day old enough to be frozen: a younger oldest day is a
-    real start of use. A person who really starts after 02:00 loses that one day, which is harmless."""
+    2:00 AM Dhaka means the morning is missing. The test only applies to the first run, before the history
+    has a start, and only to a day old enough to be frozen: a younger oldest day is a real start of
+    use. A person who really starts after 2:00 AM loses that one day, which is harmless."""
     stamps = [r.timestamp_ms for r in _anchor(records)]
-    if not stamps:
+    if not stamps or ledger.start is not None:
         return None
     first = local_dt(min(stamps))
     day = first.date()
@@ -176,29 +190,43 @@ def cut_off_day(records: Iterable[UsageRecord], ledger: Ledger, today: date) -> 
 
 
 def history_start(records: Iterable[UsageRecord], ledger: Ledger, today: date) -> date:
-    """The first full day: the day after a cut-off one, else the first day any saved or live data has, else today."""
+    """The first full day: the saved start once there is one. Before that (the first run), the day after a
+    cut-off one or the first day any live data has, but never before the cleanup point, since older records are
+    only what resumed transcripts kept; or the first saved day, if earlier; else today."""
+    if ledger.start is not None:
+        return ledger.start
     records = list(records)
     skip = cut_off_day(records, ledger, today)
     saved = list(_frozen(ledger, today))
     live = [local_day(r.timestamp_ms) for r in _anchor(records)]
-    candidates = saved + ([skip + timedelta(days=1)] if skip else [min(live)] if live else [])
+    first_live = skip + timedelta(days=1) if skip else min(live) if live else None
+    candidates = saved + ([max(first_live, first_complete_day(today))] if first_live else [])
     return min(candidates) if candidates else today
+
+
+def last_frozen_day(today: date, through: Optional[date]) -> date:
+    """The newest day `freeze` saves: 30 days old and covered by T3 Code's caches, or 50 days old regardless."""
+    forced = today - timedelta(days=FORCE_FREEZE_DAYS)
+    if through is None:
+        return forced
+    return max(forced, min(today - timedelta(days=FREEZE_AFTER_DAYS), through))
 
 
 def freeze(records: Iterable[UsageRecord], rates: Dict[str, ModelRates], today: date, ledger: Ledger,
            through: Optional[date] = None) -> Ledger:
     """The history with every live day old enough added once. A saved day is never changed. `through`
-    is the last day whose data is complete in every source (T3 Code's cache is saved only when its
-    usage page is open, so days after its newest record may be missing for the tools it reads); None freezes nothing.
-    Days before the history's first full day are left out."""
+    is the last day whose data is complete in T3 Code's caches (they are saved only when its usage page is open,
+    so days after that may be missing for the tools they read); None means they cover no day. Days before the
+    history's first full day are left out, and that day is saved with the first day frozen past it."""
     records = list(records)
-    if through is None:
-        return ledger
     start = history_start(records, ledger, today)
-    newest = min(today - timedelta(days=FREEZE_AFTER_DAYS), through)
+    newest = last_frozen_day(today, through)
     added = {day: rows for day, rows in live_days(records, rates).items()
              if start <= day <= newest and day not in ledger.days}
-    return Ledger({**ledger.days, **added}) if added else ledger
+    fixed = ledger.start if ledger.start is not None else start if start <= newest else None
+    if not added and fixed == ledger.start:
+        return ledger
+    return Ledger({**ledger.days, **added}, fixed)
 
 
 def summarise(records: Iterable[UsageRecord], rates: Dict[str, ModelRates], today: date,

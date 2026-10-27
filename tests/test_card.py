@@ -11,7 +11,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
-from ai_usage_card import cli, publish
+from ai_usage_card import cli, history, publish
 from ai_usage_card.claude import _timestamp_ms, load_claude_records, transcript_files
 from ai_usage_card.load import CacheError, load_records
 from ai_usage_card.pricing import load_rates, parse_rate_table, price
@@ -265,6 +265,14 @@ class ClaudeTranscriptTests(Case):
         with self.assertRaisesRegex(cli.Refused, "transcripts gave none"):
             cli.gather(self.userdata, empty, fx.NOW)
 
+    def test_a_stale_cursor_cache_holds_back_the_freeze_even_with_a_fresh_scan_cache(self):
+        cursor = fx.cursor_cache()
+        cursor["accounts"]["keychain"]["untilMs"] = fx.ms(9, 1, 0)  # Cursor's login lapsed on 1 Sep
+        fx.write_userdata(self.userdata, cursor=cursor)
+        self.assertEqual(cli.gather(self.userdata, self.projects, fx.NOW)[1], fx.ms(9, 1, 0))
+        fx.write_userdata(self.userdata, cursor_enabled=False)  # Cursor off: the scan cache alone decides
+        self.assertEqual(cli.gather(self.userdata, self.projects, fx.NOW)[1], fx.ms(10, 18, 2))
+
     def test_t3s_claude_records_are_ignored_but_its_other_tools_still_count(self):
         records, t3_newest = cli.gather(self.userdata, self.projects, fx.NOW)
         s = summarise(records, load_rates(self.userdata), TODAY)
@@ -273,7 +281,7 @@ class ClaudeTranscriptTests(Case):
         self.assertEqual(s.total_tokens, 5570 + 3500 + 2006 + 350)
         # 0.0169 + 0.00055 + 0.0022 (claude) + 0.0123 (cursor, reported) + 0.000055 (codex) + 0 (grok, unpriced)
         self.assertAlmostEqual(s.total_cost_usd, 0.032005, places=6)
-        self.assertEqual(t3_newest, fx.ms(10, 18, 3))  # the Cursor row, T3's newest
+        self.assertEqual(t3_newest, fx.ms(10, 18, 2))  # the Codex row: the scan cache ends before Cursor's untilMs (03:00)
 
 
 class PricingTests(Case):
@@ -475,14 +483,14 @@ class CliTests(Case):
         self.assertIn(">19 Oct<", svg)
 
     def test_a_stale_t3_cache_alone_warns_but_does_not_refuse(self):
-        # T3's newest record is 18 Oct 03:00 Dhaka, 53 hours before now; Claude Code has a reply an hour before now.
+        # T3's scan cache ends 18 Oct 02:00 Dhaka, 54 hours before now; Claude Code has a reply an hour before now.
         now = fx.NOW + timedelta(hours=52)
         fx.write_lines(self.projects / "-proj-a" / "chat3.jsonl",
                        [fx.reply("claude-opus-5-5", (10, 20, 1), fx.usage(10, 10), msg="msg_n", req="req_n")], mtime_ms=fx.ms(10, 20, 4))
         out = self.tmp / "out"
         self.assertEqual(self.run_cli("--out", str(out), now=now), 0)
         self.assertEqual(len(list(out.iterdir())), 4)
-        self.assertIn("WARNING T3 Code's newest record is 53 hours old", (self.tmp / "card.log").read_text())
+        self.assertIn("WARNING T3 Code's caches are 54 hours old", (self.tmp / "card.log").read_text())
 
     def test_future_and_out_of_range_timestamps_are_ignored(self):
         scan = fx.scan_cache()
@@ -611,7 +619,7 @@ class CliTests(Case):
             self.assertEqual(self.run_cli(*publish_args), 0)
             other_clone_pushes(orphan=True)  # the branch no longer shares history with the working clone
             self.assertEqual(self.run_cli(*publish_args), 0)
-            cards = cli.build_cards(self.userdata, fx.NOW, self.projects)
+            cards = cli.build_cards(self.userdata, fx.NOW, self.projects, history.load(self.tmp / "history.json"))
             for name in self.FOUR:
                 self.assertEqual(tip_file(name), cards[name])
 
@@ -635,9 +643,23 @@ class CliTests(Case):
                 self.assertEqual(self.run_cli(*publish_args), 1)  # two of the four files written, nothing committed
             other_clone_pushes(orphan=False)  # meanwhile the remote moves on and touches a half-written file
             self.assertEqual(self.run_cli(*publish_args), 0)
-            cards = cli.build_cards(self.userdata, fx.NOW, self.projects)  # the new data, all four files
+            cards = cli.build_cards(self.userdata, fx.NOW, self.projects, history.load(self.tmp / "history.json"))  # the new data, all four files
             for name in self.FOUR:
                 self.assertEqual(tip_file(name), cards[name])
+
+    def test_the_scheduled_run_saves_the_history_and_a_failed_save_still_publishes(self):
+        env, publish_args, _, tip_file = self._publish_setup()
+        args = ["--userdata", str(self.userdata), "--claude-projects", str(self.projects), "--log", str(self.tmp / "card.log")] + publish_args
+        default = self.tmp / "default-history.json"
+        with mock.patch.dict(os.environ, env):
+            with mock.patch.object(history.os, "replace", side_effect=OSError("read-only")):
+                self.assertEqual(cli.main(args, now=fx.NOW), 1)  # the launchd run: no --out, no --history
+            self.assertFalse(default.exists())
+            self.assertIn("<svg", tip_file("ai-usage-dark.svg"))  # the card went out before the save failed
+            self.assertIn("refused: LedgerError: history file %s cannot be written (OSError: read-only)" % default,
+                          (self.tmp / "card.log").read_text())
+            self.assertEqual(cli.main(args, now=fx.NOW), 0)
+        self.assertEqual(history.load(default).start, date(2026, 8, 20))  # 18 Oct - 59 days, the cleanup point
 
     def test_a_refusal_publishes_nothing(self):
         remote = self.tmp / "remote.git"

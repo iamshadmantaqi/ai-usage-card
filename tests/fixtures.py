@@ -73,7 +73,7 @@ def cursor_cache():
     # 3500 tokens; reported $0.0123 replaces the list price of $0.009
     rows = [[ms(10, 18, 3), 0, 1, 1000, 2000, 0, 500, 0.0123, "cursor-account:k:1:0"]]
     return {"version": 1, "strings": strings, "accounts": {"keychain": {
-        "accountKey": "k", "sinceMs": 0, "untilMs": 1, "fetchedAtMs": 1, "records": rows}}}
+        "accountKey": "k", "sinceMs": 0, "untilMs": MTIME, "fetchedAtMs": 1, "records": rows}}}
 
 
 def rates():
