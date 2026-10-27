@@ -27,6 +27,9 @@ FREEZE_AFTER_DAYS = 30  # a day this old or older is saved to the history and re
 PARTIAL_AFTER_HOUR = 2  # the oldest day of the first run is cut off if its first record is at or after 02:00 Dhaka
 TOP_MODELS = 6
 MAX_TOOLS = 4
+# Providers whose usage comes from their own servers (Cursor's account API), not from files that a cleanup deletes
+# after 60 days. They reach back further than the others, so they do not decide where the history starts.
+LONG_HISTORY_PROVIDERS = frozenset({"cursor"})
 EXCLUDED_MODELS = frozenset({"<synthetic>"})
 TOOL_LABELS = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok", "cursor": "Cursor",
                "opencode": "OpenCode", "antigravity": "Antigravity", "pi": "Pi"}
@@ -147,6 +150,13 @@ def _frozen(ledger: Ledger, today: date) -> Dict[date, List[Row]]:
     return {day: rows for day, rows in ledger.days.items() if timedelta(days=FREEZE_AFTER_DAYS) <= today - day}
 
 
+def _anchor(records: Iterable[UsageRecord]) -> List[UsageRecord]:
+    """The records that decide where the history starts: the file-based tools, which the 60-day cleanup cuts. With
+    only long-history tools in the data, those are used."""
+    usable = [r for r in records if r.model not in EXCLUDED_MODELS]
+    return [r for r in usable if r.provider not in LONG_HISTORY_PROVIDERS] or usable
+
+
 def cut_off_day(records: Iterable[UsageRecord], ledger: Ledger, today: date) -> Optional[date]:
     """The oldest live day when it is cut off part way, else None.
 
@@ -155,7 +165,7 @@ def cut_off_day(records: Iterable[UsageRecord], ledger: Ledger, today: date) -> 
     02:00 Dhaka means the morning is missing. The test only applies to the first run, when the history
     has no day on or before it, and only to a day old enough to be frozen: a younger oldest day is a
     real start of use. A person who really starts after 02:00 loses that one day, which is harmless."""
-    stamps = [r.timestamp_ms for r in records if r.model not in EXCLUDED_MODELS]
+    stamps = [r.timestamp_ms for r in _anchor(records)]
     if not stamps:
         return None
     first = local_dt(min(stamps))
@@ -165,18 +175,29 @@ def cut_off_day(records: Iterable[UsageRecord], ledger: Ledger, today: date) -> 
     return day if first.hour >= PARTIAL_AFTER_HOUR else None
 
 
+def history_start(records: Iterable[UsageRecord], ledger: Ledger, today: date) -> date:
+    """The first full day: the day after a cut-off one, else the first day any saved or live data has, else today."""
+    records = list(records)
+    skip = cut_off_day(records, ledger, today)
+    saved = list(_frozen(ledger, today))
+    live = [local_day(r.timestamp_ms) for r in _anchor(records)]
+    candidates = saved + ([skip + timedelta(days=1)] if skip else [min(live)] if live else [])
+    return min(candidates) if candidates else today
+
+
 def freeze(records: Iterable[UsageRecord], rates: Dict[str, ModelRates], today: date, ledger: Ledger,
            through: Optional[date] = None) -> Ledger:
     """The history with every live day old enough added once. A saved day is never changed. `through`
     is the last day whose data is complete in every source (T3 Code's cache is saved only when its
-    usage page is open, so days after its newest record may be missing for the tools it reads); None freezes nothing."""
+    usage page is open, so days after its newest record may be missing for the tools it reads); None freezes nothing.
+    Days before the history's first full day are left out."""
     records = list(records)
     if through is None:
         return ledger
-    skip = cut_off_day(records, ledger, today)
+    start = history_start(records, ledger, today)
     newest = min(today - timedelta(days=FREEZE_AFTER_DAYS), through)
     added = {day: rows for day, rows in live_days(records, rates).items()
-             if day <= newest and day not in ledger.days and day != skip}
+             if start <= day <= newest and day not in ledger.days}
     return Ledger({**ledger.days, **added}) if added else ledger
 
 
@@ -186,11 +207,8 @@ def summarise(records: Iterable[UsageRecord], rates: Dict[str, ModelRates], toda
     records = list(records)
     newest = max([newest_ms or 0] + [r.timestamp_ms for r in records])
     saved = _frozen(ledger, today)
-    skip = cut_off_day(records, ledger, today)
-    live = {day: rows for day, rows in live_days(records, rates).items() if day not in saved and day != skip}
-    available = sorted(set(saved) | set(live))
-    # The first full day: the day after a cut-off one, else the first day with any data.
-    earliest = skip + timedelta(days=1) if skip else (available[0] if available else today)
+    earliest = history_start(records, ledger, today)
+    live = {day: rows for day, rows in live_days(records, rates).items() if day not in saved and day >= earliest}
     first = max(earliest, window_first(today))
     days = [first + timedelta(days=i) for i in range((today - first).days + 1)]
     by_day = {day: saved.get(day) or live.get(day) or [] for day in days}

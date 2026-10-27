@@ -120,6 +120,23 @@ class PartialFirstDayTests(Base):
         self.assertIsNone(cut_off_day(old, ledger_of(d0827=[row("claude", OPUS, 5, 0.1)]), TODAY))
 
 
+class LongHistoryToolTests(Base):
+    def test_cursor_days_before_the_file_based_tools_start_do_not_move_the_start(self):
+        records = [rec(at(8, 17, 10), 999, 9.0, "cursor", "cursor-auto"),   # Cursor's server keeps more than the 60-day files
+                   rec(at(8, 27, 15), 888, 8.0),                              # Claude Code's oldest day: cut off
+                   rec(at(8, 28, 9), 20, 0.2), rec(at(8, 28, 10), 5, 0.05, "cursor", "cursor-auto")]
+        self.assertEqual(cut_off_day(records, Ledger.empty(), TODAY), date(2026, 8, 27))
+        frozen = freeze(records, {}, TODAY, Ledger.empty(), through=TODAY)
+        self.assertEqual(sorted(frozen.days), [date(2026, 8, 28)])
+        s = summarise(records, {}, TODAY, ledger=frozen)
+        self.assertEqual((s.first_day, s.total_tokens, [(t.label, t.tokens) for t in s.tools]),
+                         (date(2026, 8, 28), 25, [("Claude Code", 20), ("Cursor", 5)]))
+
+    def test_with_only_cursor_data_it_sets_the_start_itself(self):
+        records = [rec(at(8, 17, 1), 7, 0.1, "cursor", "cursor-auto")]
+        self.assertEqual(summarise(records, {}, TODAY).first_day, date(2026, 8, 17))
+
+
 class WindowTests(Base):
     def test_a_day_is_counted_from_exactly_one_source_at_the_30_day_boundary(self):
         saved = ledger_of(
