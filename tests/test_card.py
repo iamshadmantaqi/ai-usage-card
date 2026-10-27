@@ -30,6 +30,9 @@ class Case(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.userdata = fx.write_userdata(self.tmp / "userdata")
         self.projects = fx.write_projects(self.tmp / "projects")
+        patch = mock.patch.object(cli, "DEFAULT_HISTORY", self.tmp / "default-history.json")  # no test may touch the real history
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def summary(self):
         return summarise(load_records(self.userdata), load_rates(self.userdata), TODAY)
@@ -253,7 +256,8 @@ class ClaudeTranscriptTests(Case):
                            "codex\0" + str(self.tmp / "codex"): {"dir": str(self.tmp / "codex")}}
         fx.write_userdata(self.userdata, scan=scan)
         records, _ = cli.gather(self.userdata, self.projects, fx.NOW)
-        self.assertEqual(sorted(r.tokens.total for r in records if r.provider == "claude"), [100, 170, 300, 5100])
+        # 2 is the 1 Aug transcript, inside the six-month floor now (summarise drops that cut-off day, see test_history)
+        self.assertEqual(sorted(r.tokens.total for r in records if r.provider == "claude"), [2, 100, 170, 300, 5100])
 
     def test_refuses_when_t3_has_claude_usage_but_the_transcripts_give_none(self):
         empty = self.tmp / "empty"
@@ -314,22 +318,23 @@ class PricingTests(Case):
 
 
 class SummaryTests(Case):
-    def test_thirty_day_totals(self):
+    def test_window_totals(self):
         s = self.summary()
-        # 10000 + 300 + 11000 + 20 (claude) + 350 (codex) + 2006 (grok) + 3500 (cursor); synthetic and the 1 Sep record are out
+        # 10000 + 300 + 11000 + 20 (claude) + 350 (codex) + 2006 (grok) + 3500 (cursor); the synthetic row is out, and so is
+        # the 1 Sep record: the oldest day with no history yet, its first record at 09:00, so it is cut off (see test_history)
         self.assertEqual(s.total_tokens, 27176)
         # 0.02495 + 0.0022 + 0.007 + 0.5 (reported) + 0.000055 + 0 + 0.0123 (reported)
         self.assertAlmostEqual(s.total_cost_usd, 0.546505, places=6)
-        self.assertEqual((s.first_day, s.last_day, s.updated), (date(2026, 9, 19), TODAY, TODAY))
+        self.assertEqual((s.first_day, s.last_day, s.updated), (date(2026, 9, 2), TODAY, TODAY))
 
     def test_daily_buckets_use_dhaka_days(self):
         by_day = {d.day: d.tokens for d in self.summary().daily}
-        self.assertEqual(len(by_day), 30)
+        self.assertEqual(len(by_day), 47)  # 2 Sep to 18 Oct
         self.assertEqual(by_day[date(2026, 10, 18)], 3870)  # 20 + 350 + 3500; 01:00 Dhaka is still 17 Oct in UTC
         self.assertEqual(by_day[date(2026, 10, 17)], 10300)
         self.assertEqual(by_day[date(2026, 10, 16)], 11000)
         self.assertEqual(by_day[date(2026, 10, 15)], 2006)
-        self.assertEqual(by_day[date(2026, 9, 19)], 0)
+        self.assertEqual(by_day[date(2026, 9, 2)], 0)
 
     def test_split_by_tool(self):
         tools = [(t.label, t.tokens) for t in self.summary().tools]
@@ -445,7 +450,8 @@ class RenderTests(Case):
 
 class CliTests(Case):
     def run_cli(self, *extra, now=fx.NOW):
-        args = ["--userdata", str(self.userdata), "--claude-projects", str(self.projects), "--log", str(self.tmp / "card.log")] + list(extra)
+        args = ["--userdata", str(self.userdata), "--claude-projects", str(self.projects), "--log", str(self.tmp / "card.log"),
+                "--history", str(self.tmp / "history.json")] + list(extra)
         return cli.main(args, now=now)
 
     FOUR = ["ai-usage-dark.svg", "ai-usage-light.svg", "ai-usage-phone-dark.svg", "ai-usage-phone-light.svg"]
