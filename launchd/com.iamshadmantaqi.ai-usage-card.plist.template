@@ -6,7 +6,7 @@
   <string>com.iamshadmantaqi.ai-usage-card</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
+    <string>@PYTHON@</string>
     <string>-m</string>
     <string>ai_usage_card</string>
   </array>
