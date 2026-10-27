@@ -42,6 +42,8 @@ cd ai-usage-card
 
 `install.sh` copies the code to `~/Library/Application Support/ai-usage-card/app`, installs `~/Library/LaunchAgents/com.iamshadmantaqi.ai-usage-card.plist` and, with `--kickstart`, runs the job once through launchd. Log: `~/Library/Logs/ai-usage-card.log`. Run `./install.sh` again after pulling a change.
 
+The job runs the Command Line Tools `Python.app` (found from `/usr/bin/python3`), not the `/usr/bin/python3` shim, because macOS cannot grant Full Disk Access to the shim and the job needs it to read Claude Code's transcripts. Grant it once: System Settings > Privacy & Security > Full Disk Access > `+`, press Cmd+Shift+G, paste the path that `install.sh` prints (normally `/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python`) and add it. If `Python.app` is missing, `install.sh` warns and falls back to `/usr/bin/python3`.
+
 To try it without publishing: `python3 -m ai_usage_card --out /tmp/card` writes the four SVGs there. Add `--history /tmp/card/history.json` to see the history it would save.
 
 ## It refuses to publish when

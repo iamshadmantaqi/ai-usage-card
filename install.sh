@@ -18,7 +18,15 @@ rm -rf "$APP_DIR/ai_usage_card"
 cp -R "$HERE/ai_usage_card" "$APP_DIR/ai_usage_card"
 find "$APP_DIR" -name __pycache__ -prune -exec rm -rf {} +
 
-sed -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@LOG_FILE@|$LOG_FILE|g" \
+# macOS cannot grant Full Disk Access to the /usr/bin/python3 shim, and without it the job cannot read
+# Claude Code's transcripts. The grant goes to the Command Line Tools Python.app, so the job runs that.
+PYTHON="$(/usr/bin/python3 -c 'import sys; print(sys.base_prefix)')/Resources/Python.app/Contents/MacOS/Python"
+if [ ! -x "$PYTHON" ]; then
+  echo "Warning: $PYTHON not found; the job will use /usr/bin/python3, which cannot be given Full Disk Access." >&2
+  PYTHON=/usr/bin/python3
+fi
+
+sed -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@LOG_FILE@|$LOG_FILE|g" -e "s|@PYTHON@|$PYTHON|g" \
   "$HERE/launchd/$LABEL.plist.template" > "$PLIST"
 plutil -lint "$PLIST" >/dev/null
 
@@ -30,6 +38,8 @@ for _ in $(seq 1 50); do
 done
 launchctl bootstrap "$DOMAIN" "$PLIST"
 echo "Installed $LABEL (daily at 06:00). Log: $LOG_FILE"
+echo "The job runs: $PYTHON"
+echo "It needs Full Disk Access: System Settings > Privacy & Security > Full Disk Access > +, Cmd+Shift+G, then the path above."
 
 if [ "${1:-}" = "--kickstart" ]; then
   launchctl kickstart -k "$DOMAIN/$LABEL"
