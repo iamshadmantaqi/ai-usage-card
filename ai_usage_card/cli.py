@@ -1,4 +1,4 @@
-"""Entry point: read Claude Code's transcripts and T3 Code's caches, build the card, write it or publish it.
+"""Entry point: read Claude Code's transcripts and T3 Code's caches and the saved daily history, build the card, write it or publish it.
 
 Exit 0 when the card is current (published or unchanged); exit 1 when it refuses, with the
 reason in the log. A refusal never commits or pushes anything.
@@ -12,17 +12,20 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from . import history as ledger_file
 from . import publish as publisher
 from .claude import PROJECTS_DIR, load_claude_records
 from .load import CacheError, UsageRecord, load_t3
 from .pricing import load_rates
 from .privacy import PrivacyError, check_privacy
-from .render import DARK, LIGHT, fmt_cost, fmt_tokens, render, render_phone
-from .summarise import TIMEZONE, summarise, window_start_ms
+from .history import Ledger, LedgerError
+from .render import DARK, LIGHT, fmt_cost, fmt_tokens, period_label, render, render_phone
+from .summarise import TIMEZONE, freeze, local_day, summarise, window_start_ms
 
 HOME = Path.home()
 DEFAULT_USERDATA = HOME / ".t3" / "userdata"
 DEFAULT_CLONE = HOME / "Library" / "Application Support" / "ai-usage-card" / "profile"
+DEFAULT_HISTORY = HOME / "Library" / "Application Support" / "ai-usage-card" / "history.json"
 DEFAULT_LOG = HOME / "Library" / "Logs" / "ai-usage-card.log"
 DEFAULT_REPO = "https://github.com/iamshadmantaqi/iamshadmantaqi.git"
 GH_CREDENTIAL_HELPER = "!/opt/homebrew/bin/gh auth git-credential"
@@ -56,10 +59,16 @@ def gather(userdata: Path, projects: Path, now: datetime) -> Tuple[List[UsageRec
     return [r for r in t3 if r.provider != "claude"] + claude, t3_newest
 
 
-def build_cards(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR) -> Dict[str, str]:
-    """The four SVGs (wide and phone, light and dark), or Refused / CacheError / PrivacyError. Pure of side effects except reading.
+def build_cards(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: Optional[Ledger] = None) -> Dict[str, str]:
+    """The four SVGs, without the history that was frozen on the way (see `build`)."""
+    return build(userdata, now, projects, ledger)[0]
 
-    The window ends today. Claude Code is read from its transcripts, so it is always current; T3
+
+def build(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: Optional[Ledger] = None) -> Tuple[Dict[str, str], Ledger]:
+    """The four SVGs (wide and phone, light and dark) and the history with any newly frozen days, or
+    Refused / CacheError / PrivacyError. Pure of side effects except reading: the caller saves the history.
+
+    The window is six months and ends today; days 30 or more days old come from `ledger` once frozen. Claude Code is read from its transcripts, so it is always current; T3
     Code saves its usage cache only when its usage page is open, so a stale T3 cache costs the
     other tools their recent days, which is logged as a warning."""
     now_ms = int(now.timestamp() * 1000)
@@ -74,21 +83,30 @@ def build_cards(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR) ->
     if t3_newest is None or now_ms - t3_newest > max_age_ms:
         log.warning("T3 Code's newest record is %s: Cursor, Codex and other tools may be missing recent days"
                     " (open its usage page)", "missing" if t3_newest is None else "%.0f hours old" % ((now_ms - t3_newest) / 3.6e6))
-    summary = summarise(records, load_rates(userdata), now.astimezone(TIMEZONE).date(), newest_ms)
+    ledger = ledger or Ledger.empty()
+    rates, today = load_rates(userdata), now.astimezone(TIMEZONE).date()
+    # A day is frozen only when T3 Code's cache reaches past it: that cache is saved when its usage page is open.
+    through = local_day(t3_newest) - timedelta(days=1) if t3_newest is not None else None
+    if through is None:
+        log.warning("T3 Code has no records in the window: no day is frozen into the history this run")
+    frozen = freeze(records, rates, today, ledger, through)
+    summary = summarise(records, rates, today, newest_ms, frozen)
     cards = {"ai-usage-light.svg": render(summary, LIGHT), "ai-usage-dark.svg": render(summary, DARK),
              "ai-usage-phone-light.svg": render_phone(summary, LIGHT), "ai-usage-phone-dark.svg": render_phone(summary, DARK)}
     for svg in cards.values():
         check_privacy(svg)
-    log.info("30 days: %s tokens, %s API-equivalent, updated %s", fmt_tokens(summary.total_tokens),
-             fmt_cost(summary.total_cost_usd), summary.updated.isoformat())
-    return cards
+    log.info("%s: %s tokens, %s API-equivalent, %d weeks, updated %s; history holds %d days (%d frozen this run)",
+             period_label(summary).lower(), fmt_tokens(summary.total_tokens), fmt_cost(summary.total_cost_usd),
+             len(summary.weekly), summary.updated.isoformat(), len(frozen.days), len(frozen.days) - len(ledger.days))
+    return cards, frozen
 
 
 def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> int:
     parser = argparse.ArgumentParser(prog="ai_usage_card", description=__doc__)
     parser.add_argument("--userdata", type=Path, default=DEFAULT_USERDATA, help="T3 Code's userdata folder")
     parser.add_argument("--claude-projects", type=Path, default=PROJECTS_DIR, help="Claude Code's transcripts folder (the Claude folders T3 Code scans are read as well)")
-    parser.add_argument("--out", type=Path, help="write the SVGs here and do not publish")
+    parser.add_argument("--out", type=Path, help="write the SVGs here and do not publish (the history is then only read, unless --history is given)")
+    parser.add_argument("--history", type=Path, help="the saved daily history (default: %s)" % DEFAULT_HISTORY)
     parser.add_argument("--repo", default=DEFAULT_REPO, help="profile repo to publish to")
     parser.add_argument("--clone", type=Path, default=DEFAULT_CLONE, help="working clone used for publishing")
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
@@ -101,7 +119,15 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
                         handlers=[logging.FileHandler(str(args.log))] + ([logging.StreamHandler(sys.stderr)] if sys.stderr.isatty() else []),
                         force=True)
     try:
-        cards = build_cards(args.userdata, now or datetime.now(TIMEZONE), args.claude_projects)
+        history_path = args.history or DEFAULT_HISTORY
+        saved = ledger_file.load(history_path)  # a corrupt file refuses the run here, before anything can overwrite it
+        cards, frozen = build(args.userdata, now or datetime.now(TIMEZONE), args.claude_projects, saved)
+        added = len(frozen.days) - len(saved.days)
+        if added and args.out and not args.history:
+            log.info("trial run: %d new days not saved to %s (pass --history to save them)", added, history_path)
+        elif added:
+            ledger_file.save(history_path, frozen)
+            log.info("saved %d new days to %s", added, history_path)
         if args.out:
             args.out.mkdir(parents=True, exist_ok=True)
             for name, svg in cards.items():
@@ -112,7 +138,7 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
         else:
             log.info("card unchanged, nothing committed")
         return 0
-    except (Refused, CacheError, PrivacyError, publisher.PublishError) as error:
+    except (Refused, CacheError, PrivacyError, LedgerError, publisher.PublishError) as error:
         log.error("refused: %s: %s", type(error).__name__, error)
         return 1
     except Exception:
