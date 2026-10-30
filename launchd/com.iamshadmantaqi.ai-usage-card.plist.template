@@ -6,8 +6,9 @@
   <string>com.iamshadmantaqi.ai-usage-card</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
-    <string>@APP_DIR@/run-card.sh</string>
+    <string>@PYTHON@</string>
+    <string>-m</string>
+    <string>ai_usage_card</string>
   </array>
   <key>WorkingDirectory</key>
   <string>@APP_DIR@</string>
