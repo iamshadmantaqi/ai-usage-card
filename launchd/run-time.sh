@@ -8,4 +8,5 @@ hour="$(plutil -extract StartCalendarInterval.Hour raw -o - "$plist")"
 minute="$(plutil -extract StartCalendarInterval.Minute raw -o - "$plist")"
 local_time="$(printf '%02d:%02d:00' "$hour" "$minute")"
 epoch="$(date -j -f '%H:%M:%S' "$local_time" +%s)"
-TZ=Asia/Dhaka date -r "$epoch" '+%-I:%M %p BD time'
+# LC_ALL=C: %p is AM or PM only in the C locale; German gives an empty string, Japanese 午前.
+TZ=Asia/Dhaka LC_ALL=C date -r "$epoch" '+%-I:%M %p BD time'

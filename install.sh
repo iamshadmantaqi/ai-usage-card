@@ -30,7 +30,8 @@ sed -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@LOG_FILE@|$LOG_FILE|g" -e "s|@PYTHON@|$PY
   "$HERE/launchd/$LABEL.plist.template" > "$PLIST"
 plutil -lint "$PLIST" >/dev/null
 # The schedule is the plist's; show it as Bangladesh time rather than as the raw hour and minute.
-RUN_TIME="$(bash "$HERE/launchd/run-time.sh" "$PLIST")"
+# Only the message needs it, so a failure here must not stop the install.
+RUN_TIME="$(bash "$HERE/launchd/run-time.sh" "$PLIST")" || RUN_TIME="the time set in $PLIST"
 
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 # bootout returns before the job is gone, and bootstrapping the same label too soon fails.
