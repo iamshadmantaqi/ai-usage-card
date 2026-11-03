@@ -32,6 +32,43 @@ class TemplateTests(unittest.TestCase):
                                   check=True, capture_output=True, text=True).stdout.strip()
             self.assertEqual(args, PYTHON_APP)
 
+    def test_install_script_shows_the_run_time_from_the_plist(self):
+        text = open(os.path.join(ROOT, "install.sh")).read()
+        self.assertNotIn("06:00", text)
+        self.assertIn("run-time.sh", text)
+
+
+@unittest.skipUnless(shutil.which("plutil"), "plutil is macOS only")
+class RunTimeTests(unittest.TestCase):
+    SCRIPT = os.path.join(ROOT, "launchd", "run-time.sh")
+
+    def run_time(self, zone, hour=None, minute=None):
+        """What run-time.sh prints for a plist scheduled at hour:minute on a Mac set to zone."""
+        text = open(TEMPLATE).read()
+        if hour is not None:
+            text = text.replace("<integer>6</integer>", "<integer>%d</integer>" % hour)
+            text = text.replace("<integer>0</integer>", "<integer>%d</integer>" % minute)
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "job.plist")
+            with open(plist, "w") as handle:
+                handle.write(text)
+            env = dict(os.environ, TZ=zone)
+            result = subprocess.run(["bash", self.SCRIPT, plist], env=env, check=True,
+                                    capture_output=True, text=True)
+        return result.stdout.strip()
+
+    def test_template_schedule_on_a_dhaka_mac(self):
+        self.assertEqual(self.run_time("Asia/Dhaka"), "6:00 AM BD time")
+
+    def test_a_mac_in_another_zone_is_converted(self):
+        # 06:00 in India is 06:30 in Dhaka (both zones have no daylight saving).
+        self.assertEqual(self.run_time("Asia/Kolkata"), "6:30 AM BD time")
+
+    def test_afternoon_and_midnight_use_12_hour_form(self):
+        self.assertEqual(self.run_time("Asia/Dhaka", 18, 5), "6:05 PM BD time")
+        self.assertEqual(self.run_time("Asia/Dhaka", 0, 0), "12:00 AM BD time")
+        self.assertEqual(self.run_time("Asia/Dhaka", 12, 30), "12:30 PM BD time")
+
     def test_install_script_substitutes_python(self):
         text = open(os.path.join(ROOT, "install.sh")).read()
         self.assertIn("s|@PYTHON@|$PYTHON|g", text)
