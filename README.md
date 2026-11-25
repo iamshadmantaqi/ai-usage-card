@@ -48,7 +48,7 @@ To try it without publishing: `python3 -m ai_usage_card --out /tmp/card` writes 
 
 ## It refuses to publish when
 
-- the cache is missing, unparsable or not one of the versions checked (5 to 9; T3 writes each version to its own file, and the newest file is read), or T3 Code has started writing a version newer than 9, which someone has to check against T3's source and add to `SCAN_CACHE_VERSIONS` in `load.py`;
+- the cache is missing, unparsable or older than version 5 (T3 writes each version to its own file and deletes the older ones, so the newest file is read), or a version newer than 17 (the last one checked against T3's source) has files or rows this card cannot read. A newer version whose files and rows still match is read with a warning in the log; check it against T3's source then and raise `SCAN_CACHE_CHECKED_THROUGH` in `load.py`;
 - the newest record from any source is older than 48 hours (a stale T3 Code cache alone only logs a warning);
 - no Claude Code transcripts folder exists, a transcripts folder or file cannot be read, or T3 Code has Claude Code usage in the window while the transcripts give none;
 - the history file is damaged (see above);

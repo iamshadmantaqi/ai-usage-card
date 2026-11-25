@@ -88,22 +88,65 @@ class LoadTests(Case):
         fx.write_userdata(self.userdata, scan=scan, scan_version=9)
         self.assertEqual({r.provider for r in load_records(self.userdata)}, {"codex", "grok", "cursor"})
 
-    def test_a_cache_version_newer_than_the_ones_checked_is_refused(self):
-        for name in ("usage-scan-cache-v10.json", "usage-cursor-account-cache-v2.json"):
-            (self.userdata / name).write_text("{}")
-            with self.assertRaises(CacheError, msg=name) as caught:
-                load_records(self.userdata)
-            self.assertIn("T3 Code now writes " + name, str(caught.exception))
-            (self.userdata / name).unlink()
-        (self.userdata / "usage-scan-cache-v4.json").write_text("{}")  # an older one left behind is fine
+    def test_a_newer_cursor_cache_version_is_refused(self):
+        (self.userdata / "usage-cursor-account-cache-v2.json").write_text("{}")
+        with self.assertRaises(CacheError) as caught:
+            load_records(self.userdata)
+        self.assertIn("T3 Code now writes usage-cursor-account-cache-v2.json", str(caught.exception))
+        (self.userdata / "usage-cursor-account-cache-v2.json").unlink()
+        (self.userdata / "usage-scan-cache-v4.json").write_text("{}")  # an older scan cache left behind is fine
         load_records(self.userdata)
 
-    def test_a_file_whose_version_field_is_not_a_supported_one_is_refused(self):
+    def test_reads_a_version_17_cache_with_literal_totals(self):
+        u17 = fx.write_userdata(self.tmp / "u17", scan=fx.scan_cache_v17(), scan_version=17)
+        records = load_records(u17)  # a checked version logs no warning (the unknown-version test asserts the opposite)
+        by_key = {r.dedupe_key: r for r in records if r.dedupe_key}
+        self.assertEqual(by_key["msg_a:req_a"].tokens.total, 10000)
+        self.assertEqual(by_key["msg_a:req_a"].tokens.cache_creation_1h, 600)  # the fourteenth row field
+        self.assertEqual(by_key["msg_b:req_b"].tokens.total, 300)
+        self.assertEqual(by_key["msg_b:req_b"].speed, "fast")
+        self.assertEqual(by_key["msg_d:req_d"].reported_cost_usd, 0.5)
+        self.assertEqual(sorted(r.tokens.total for r in records if r.provider == "codex"), [350])
+        self.assertEqual(sorted(r.tokens.total for r in records if r.provider == "grok"), [1, 2, 3, 2000])
+        v5 = sorted((r.provider, r.model, r.tokens.total) for r in load_records(self.userdata) if r.provider != "cursor")
+        self.assertEqual(sorted((r.provider, r.model, r.tokens.total) for r in records if r.provider != "cursor"), v5)
+
+    def test_an_unknown_newer_version_with_a_matching_structure_is_read_with_a_warning(self):
+        u18 = fx.write_userdata(self.tmp / "u18", scan=fx.scan_cache_v17(version=18), scan_version=18)
+        with self.assertLogs("ai-usage-card", level="WARNING") as logged:
+            records = load_records(u18)
+        self.assertIn("usage-scan-cache-v18.json", logged.output[0])
+        self.assertIn("newer than the version 17", logged.output[0])
+        self.assertEqual(sorted(r.tokens.total for r in records if r.provider == "codex"), [350])
+        self.assertEqual({r.dedupe_key: r.tokens.total for r in records}["msg_a:req_a"], 10000)
+
+    def test_an_unknown_newer_version_with_a_broken_structure_is_refused(self):
+        bad_row = fx.scan_cache_v17(version=18)
+        bad_row["files"]["/f/a.jsonl"]["r"][0][3] = "lots"  # a usage field that is not a number
+        short_row = fx.scan_cache_v17(version=18)
+        short_row["files"]["/f/a.jsonl"]["r"][0] = short_row["files"]["/f/a.jsonl"]["r"][0][:8]
+        bad_entry = fx.scan_cache_v17(version=18)
+        del bad_entry["files"]["/f/c.jsonl"]["o"]
+        no_models = fx.scan_cache_v17(version=18)
+        no_models["models"] = {"0": "x"}
+        for name, scan in (("bad_row", bad_row), ("short_row", short_row), ("bad_entry", bad_entry), ("no_models", no_models)):
+            folder = fx.write_userdata(self.tmp / name, scan=scan, scan_version=18)
+            with self.assertRaises(CacheError, msg=name):
+                load_records(folder)
+
+    def test_a_checked_version_with_one_bad_file_still_only_drops_that_file(self):
+        scan = fx.scan_cache_v17()
+        scan["files"]["/f/c.jsonl"]["r"][0][3] = "lots"
+        folder = fx.write_userdata(self.tmp / "u17bad", scan=scan, scan_version=17)
+        self.assertEqual([r for r in load_records(folder) if r.provider == "codex"][0].tokens.total, 350)  # d.jsonl still has it
+        self.assertEqual(len([r for r in load_records(folder) if r.provider == "codex"]), 1)
+
+    def test_a_file_whose_version_field_is_not_the_one_in_its_name_is_refused(self):
         scan = fx.scan_cache_v9()
-        scan["version"] = 10
-        fx.write_userdata(self.tmp / "u10", scan=scan, scan_version=9)
+        scan["version"] = 18
+        fx.write_userdata(self.tmp / "u18", scan=scan, scan_version=9)
         with self.assertRaises(CacheError):
-            load_records(self.tmp / "u10")
+            load_records(self.tmp / "u18")
 
     def test_a_file_whose_version_field_differs_from_its_name_is_refused(self):
         fx.write_userdata(self.tmp / "u9", scan=fx.scan_cache(version=5), scan_version=9)
@@ -119,7 +162,7 @@ class LoadTests(Case):
         (self.userdata / "usage-scan-cache-v5.json").rename(self.userdata / "usage-scan-cache-v4.json")
         with self.assertRaises(CacheError) as caught:
             load_records(self.userdata)
-        self.assertIn("cache file is missing: usage-scan-cache-v9.json", str(caught.exception))
+        self.assertIn("cache file is missing: usage-scan-cache-v17.json", str(caught.exception))
         self.assertNotIn("now writes", str(caught.exception))
 
     def test_files_with_a_read_position_t3_rejects_are_skipped(self):
