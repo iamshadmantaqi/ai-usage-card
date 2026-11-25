@@ -1,10 +1,12 @@
 """Claude Code usage, read straight from its transcripts (`~/.claude/projects/**/*.jsonl`).
 
-T3 Code's scan cache is not used for Claude Code because it undercounts it in two ways:
+T3 Code's scan cache is not used for Claude Code because, up to cache version 9, it undercounted it in
+two ways (version 17 keeps the largest of a reply's copies and stores the 1-hour cache writes; the card
+still reads the transcripts, which it has been checked against):
 
 * Claude Code writes an assistant reply to the transcript several times while it streams, and only
-  the last copy carries the final `usage.output_tokens`. T3 keeps the first copy.
-* T3 prices every cache write at the 5-minute rate; `usage.cache_creation.ephemeral_1h_input_tokens`
+  the last copy carries the final `usage.output_tokens`. T3 kept the first copy.
+* T3 priced every cache write at the 5-minute rate; `usage.cache_creation.ephemeral_1h_input_tokens`
   are billed higher.
 
 Only the model name, the timestamp and the token counts are taken from a line; no text, path or id

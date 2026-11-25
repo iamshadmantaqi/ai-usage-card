@@ -68,6 +68,24 @@ def scan_cache_v9():
     return cache
 
 
+def scan_cache_v17(version=17):
+    """The layout T3 writes at version 17: `coveredSince` at the top, `mt` beside `mr`, and Claude and Codex
+    rows fourteen wide (null service tier turn id, then the cache creation written with the 1-hour lifetime).
+    Same usage figures as `scan_cache()`. Demo data only."""
+    cache = scan_cache(version=version)
+    cache["sources"] = {"claude\0/demo/projects": {"dir": "/demo/projects"}}
+    cache["coveredSince"] = {"claude\0/demo/projects": ms(8, 1, 0)}
+    for file_entry in cache["files"].values():
+        file_entry["mr"] = 0
+    cache["files"]["/f/a.jsonl"]["r"] = [A1 + [None, 600], A2 + [None, 0], A3 + [None, 0], A4 + [None, 0], A5 + [None, 0]]
+    cache["files"]["/f/b.jsonl"]["r"] = [A1 + [None, 600], B1 + [None, 0]]
+    cache["files"]["/f/b.jsonl"]["mr"] = 1
+    cache["files"]["/f/b.jsonl"]["mt"] = [ms(10, 17, 13)]
+    cache["files"]["/f/c.jsonl"]["r"] = [CODEX + [None, 0]]
+    cache["files"]["/f/d.jsonl"]["r"] = [CODEX + [None, 0]]
+    return cache  # grok's rows stay twelve wide
+
+
 def cursor_cache():
     strings = ["cursor-grok-4.6-high-fast", "agent-session"]
     # 3500 tokens; reported $0.0123 replaces the list price of $0.009

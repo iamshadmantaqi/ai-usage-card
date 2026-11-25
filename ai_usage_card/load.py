@@ -3,17 +3,28 @@
 The record layouts below were read from T3 Code's own source (the bundled server,
 `usageScanCache.ts` and `accountUsage.ts` in `provider-cursor`), not guessed.
 
-Scan cache `usage-scan-cache-v<N>.json`, N from 5 to 9 (T3 writes each version to its own file)::
+Scan cache `usage-scan-cache-v<N>.json`, N from 5 to 17 (checked against T3's bundled server in November
+2026; T3 writes each version to its own file and deletes the older ones once the new one is saved)::
 
-    {sources, version: N, models: [name], sessions: [id], files: {path: entry}}
+    {sources, coveredSince, version: N, models: [name], sessions: [id], files: {path: entry}}
     entry  = {s: size, m: mtimeMs, p: provider, r: [row], t: [row], mr, o, gl, gh, cs}
     row    = [timestampMs, modelIdx, sessionIdx, uncachedInput, cachedInput,
               cacheCreation, output, reasoning, dedupeKey, reportedCostUsd,
-              speedIdx, rateModelIdx, serviceTierTurnId]   (speedIdx: 0 standard, 1 fast, 2 ultrafast)
+              speedIdx, rateModelIdx, serviceTierTurnId, cacheCreation1h]   (speedIdx: 0 standard, 1 fast, 2 ultrafast)
 
-Versions 6 to 9 left the first twelve row fields alone. Version 7 added the optional last one
-(a string, not a usage figure) and `mr` (a count of malformed lines in the file); the rest of the
-changes, up to 9, are to how T3 resumes reading Codex files. None of that is read here.
+Versions 6 to 17 left the first twelve row fields alone. Version 7 added the optional thirteenth (a
+string or null, not a usage figure) and `mr` (a count of malformed lines in the file). Between 9 and 17
+T3 added a fourteenth, `cacheCreation1h` (the part of `cacheCreation` written with the 1-hour lifetime;
+T3 writes it only when set, with the thirteenth before it, null when there is no turn id; T3 prices it at
+the 1-hour rate and `min(cacheCreation1h, cacheCreation)` of `cacheCreation` at the 5-minute rate), `mt` (the
+malformed lines' times) and, at the top level, `coveredSince` (per source, how far back T3 has scanned).
+Version 17 adds the record's time to Grok dedupe keys read from older files, as `_decode_scan_rows` does.
+The other changes, up to 17, are to how T3 resumes reading Codex, Grok and Claude files. `coveredSince`,
+`mr`, `mt` and the resume state are not read here.
+
+A version above the last one checked (`SCAN_CACHE_CHECKED_THROUGH`) is read anyway when its structure
+matches this layout, with a warning; it is refused when a file entry or row does not match, or a row is
+wider than fourteen fields.
 
 Cursor cache `usage-cursor-account-cache-v1.json`::
 
@@ -27,15 +38,20 @@ Reasoning tokens are a subset of output tokens, so they are never added to a tot
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+log = logging.getLogger("ai-usage-card")
+
 SCAN_CACHE_STEM = "usage-scan-cache-v"
 CURSOR_CACHE_FILE = "usage-cursor-account-cache-v1.json"
 SETTINGS_FILE = "settings.json"
-SCAN_CACHE_VERSIONS = (5, 6, 7, 8, 9)
+SCAN_CACHE_MIN_VERSION = 5
+SCAN_CACHE_CHECKED_THROUGH = 17
+SCAN_ROW_FIELDS = 14  # the widest row in a checked version
 CURSOR_CACHE_VERSION = 1
 SPEEDS = ("standard", "fast", "ultrafast")
 # T3 re-keys records of these providers when one session spans several files.
@@ -54,7 +70,8 @@ class Tokens:
     output: int
     reasoning: int
     # Part of `cache_creation` that was written with the 1-hour lifetime (priced higher than the
-    # 5-minute default). T3's caches do not split writes, so there it is always 0.
+    # 5-minute default), never added to a total. T3 records it only for Claude Code, in cache versions
+    # after 9; the card reads Claude Code from its transcripts, so a T3 record's figure is not used.
     cache_creation_1h: int = 0
 
     @property
@@ -108,30 +125,44 @@ def _read_json(path: Path) -> Any:
         raise CacheError("cache file cannot be read: %s (%s)" % (path.name, type(error).__name__))
 
 
-def _decode_scan_rows(rows: Any, provider: str, models: List[str], sessions: List[str]) -> Optional[List[UsageRecord]]:
-    """Mirror of T3's `decodeRecords`: one bad row invalidates the whole file."""
+def _js_number(value: float) -> str:
+    """A whole number as JavaScript's template strings print it ("1700000000000", not "1.7e12")."""
+    return str(int(value)) if float(value).is_integer() else repr(float(value))
+
+
+def _decode_scan_rows(rows: Any, provider: str, models: List[str], sessions: List[str], version: int,
+                      strict: bool) -> Optional[List[UsageRecord]]:
+    """Mirror of T3's `decodeRecords`: one bad row invalidates the whole file. `strict` (a version not checked
+    against T3's source) also rejects a row wider than the layout above, as an extra field could change a total."""
     if not isinstance(rows, list):
         return None
     records = []  # type: List[UsageRecord]
     for row in rows:
-        if not isinstance(row, list) or len(row) < 11:
+        if not isinstance(row, list) or len(row) < 11 or (strict and len(row) > SCAN_ROW_FIELDS):
             return None
         ts, model_idx, session_idx, uncached, cached, creation, output, reasoning, key, cost, speed_idx = row[:11]
         rate_idx = row[11] if len(row) > 11 else None
+        turn_id = row[12] if len(row) > 12 else None
+        one_hour = row[13] if len(row) > 13 else 0  # T3 defaults only a missing one; a null drops the file
         speed = SPEEDS[speed_idx] if isinstance(speed_idx, int) and not isinstance(speed_idx, bool) and 0 <= speed_idx < len(SPEEDS) else None
         model = models[model_idx] if isinstance(model_idx, int) and 0 <= model_idx < len(models) else None
         rate_model = models[rate_idx] if isinstance(rate_idx, int) and 0 <= rate_idx < len(models) else None
         if (not _num(ts) or model is None or (rate_idx is not None and rate_model is None)
-                or not all(_num(v) for v in (uncached, cached, creation, output, reasoning)) or speed is None):
+                or (turn_id is not None and not isinstance(turn_id, str))
+                or not all(_num(v) for v in (uncached, cached, creation, output, reasoning, one_hour)) or speed is None):
             return None
         session = sessions[session_idx] if isinstance(session_idx, int) and 0 <= session_idx < len(sessions) else ""
+        if (isinstance(key, str) and provider == "grok" and version < 17 and key.endswith(":" + model)
+                and not key.endswith(":%s:%s" % (_js_number(ts), model))):
+            # T3 17 adds the time to Grok keys written before it, so two replies no longer share one key.
+            key = "%s%s:%s" % (key[:-len(model)], _js_number(ts), model)
         records.append(UsageRecord(
             provider=provider,
             timestamp_ms=int(ts),
             model=model,
             rate_model=rate_model,
             session_id=session,
-            tokens=Tokens(int(uncached), int(cached), int(creation), int(output), int(reasoning)),
+            tokens=Tokens(int(uncached), int(cached), int(creation), int(output), int(reasoning), int(one_hour)),
             reported_cost_usd=float(cost) if _num(cost) else None,
             speed=speed,
             dedupe_key=key if isinstance(key, str) else None,
@@ -140,25 +171,29 @@ def _decode_scan_rows(rows: Any, provider: str, models: List[str], sessions: Lis
 
 
 def scan_cache_path(folder: Path) -> Tuple[Path, int]:
-    """The newest scan cache file T3 has written, and its version. T3 gives each cache version its own
-    file name and leaves the old ones behind, frozen, so the highest number is the live one. A version
-    this code has not been checked against is refused rather than guessed at."""
-    found = {}  # type: Dict[int, Path]
+    """The scan cache file T3 saved last, and its version. T3 gives each cache version its own file name
+    and deletes the old ones once the new one is saved, so there is normally one. Two are left when an
+    older T3 shares the folder (it cannot read the newer file, so it leaves it frozen and writes its own):
+    the one saved last is the live one, and the higher version wins a tie. Files below version 5 are
+    never read. A version above
+    `SCAN_CACHE_CHECKED_THROUGH` is returned too; `_read_scan_document` warns and checks its structure."""
+    found = {}  # type: Dict[int, Tuple[float, Path]]
     for candidate in folder.glob(SCAN_CACHE_STEM + "*.json"):
         # ASCII digits with no leading zero, as T3 writes them; int() would reject other Unicode digits.
         number = candidate.name[len(SCAN_CACHE_STEM):-len(".json")]
         if re.fullmatch(r"[1-9][0-9]*", number):
-            found[int(number)] = candidate
+            try:
+                found[int(number)] = (candidate.stat().st_mtime, candidate)
+            except FileNotFoundError:  # removed by T3 between the listing and the stat
+                continue
     if not found:
-        raise CacheError("cache file is missing: %s%d.json" % (SCAN_CACHE_STEM, SCAN_CACHE_VERSIONS[-1]))
-    newest = max(found)
-    if newest > SCAN_CACHE_VERSIONS[-1]:
-        raise CacheError("T3 Code now writes %s; this card reads only versions %d to %d"
-                         % (found[newest].name, SCAN_CACHE_VERSIONS[0], SCAN_CACHE_VERSIONS[-1]))
-    if newest not in SCAN_CACHE_VERSIONS:
+        raise CacheError("cache file is missing: %s%d.json" % (SCAN_CACHE_STEM, SCAN_CACHE_CHECKED_THROUGH))
+    readable = [version for version in found if version >= SCAN_CACHE_MIN_VERSION]
+    if not readable:
         raise CacheError("cache file is missing: %s%d.json (only an older %s is there)"
-                         % (SCAN_CACHE_STEM, SCAN_CACHE_VERSIONS[-1], found[newest].name))
-    return found[newest], newest
+                         % (SCAN_CACHE_STEM, SCAN_CACHE_CHECKED_THROUGH, found[max(found)][1].name))
+    live = max(readable, key=lambda version: (found[version][0], version))
+    return found[live][1], live
 
 
 def _read_scan_document(path: Path, version: int) -> Dict[str, Any]:
@@ -170,21 +205,32 @@ def _read_scan_document(path: Path, version: int) -> Dict[str, Any]:
     if (not isinstance(models, list) or not isinstance(sessions, list) or not isinstance(files, dict)
             or not all(isinstance(m, str) for m in models) or not all(isinstance(s, str) for s in sessions)):
         raise CacheError("scan cache has an unexpected shape")
+    if version > SCAN_CACHE_CHECKED_THROUGH:
+        log.warning("T3 Code writes %s, newer than the version %d this card was checked against; "
+                    "reading it, its top-level structure matches", path.name, SCAN_CACHE_CHECKED_THROUGH)
     return document
 
 
 def _scan_records(document: Dict[str, Any], min_file_mtime_ms: float) -> List[List[UsageRecord]]:
+    """Like T3, a bad file entry or row only drops that file. In a version not checked against T3's
+    source (`strict`) it means the layout changed, so the cache is refused instead."""
+    strict = document["version"] > SCAN_CACHE_CHECKED_THROUGH
     models, sessions = document["models"], document["sessions"]
     per_file = []  # type: List[List[UsageRecord]]
     for entry in document["files"].values():
-        if not isinstance(entry, dict) or not _num(entry.get("s")) or not _num(entry.get("m")):
+        if (not isinstance(entry, dict) or not _num(entry.get("s")) or not _num(entry.get("m"))
+                or not isinstance(entry.get("p"), str) or not _valid_position(entry)):
+            if strict:
+                raise CacheError("scan cache version %d has a file entry this card cannot read" % document["version"])
             continue
-        provider = entry.get("p")
-        if not isinstance(provider, str) or entry["m"] < min_file_mtime_ms or not _valid_position(entry):
+        provider = entry["p"]
+        if entry["m"] < min_file_mtime_ms:
             continue
-        head = _decode_scan_rows(entry.get("r"), provider, models, sessions)
-        tail = _decode_scan_rows(entry.get("t"), provider, models, sessions)
+        head = _decode_scan_rows(entry.get("r"), provider, models, sessions, document["version"], strict)
+        tail = _decode_scan_rows(entry.get("t"), provider, models, sessions, document["version"], strict)
         if head is None or tail is None:
+            if strict:
+                raise CacheError("scan cache version %d has rows this card cannot read" % document["version"])
             continue
         per_file.append(head + tail)
     return per_file
