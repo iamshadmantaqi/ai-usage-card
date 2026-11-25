@@ -3,9 +3,11 @@
 The history never recomputes a frozen day, so a day frozen while Cursor's usage was missing (an account T3 Code had
 not read yet, or Cursor switched off) keeps that gap. `repair_cursor` rebuilds the `cursor` rows of every frozen day
 that T3 Code's Cursor cache still holds, with the same loader, dedupe, rows and pricing the card freezes with, and
-leaves every other tool's rows alone. A day the cache does not hold is not touched; a day it would change but the
-cache does not fully cover (before the earliest `sinceMs` or after the earliest `untilMs` of its accounts) refuses
-the whole repair. Running it again changes nothing.
+leaves every other tool's rows alone. A day the cache does not hold is not touched. The whole repair refuses when a
+day it would change is not fully covered by every account in the cache (it starts before the latest `sinceMs` or
+ends after the earliest `untilMs`, a lapsed account's included, since its usage after that is unknown), or when a
+day would end up with fewer Cursor tokens than the history holds (the repair only puts missing usage back). Running
+it again changes nothing.
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 from . import history as ledger_file
 from .history import Ledger, LedgerError, Row
-from .load import CacheError, cursor_cache_path, dedupe, load_cursor_coverage
+from .load import CacheError, cursor_cache_path, load_cursor_coverage, load_t3
 from .pricing import load_rates
 from .summarise import TIMEZONE, live_days
 
@@ -52,11 +54,12 @@ def _midnight_ms(day: date) -> int:
 
 def repair_cursor(ledger: Ledger, userdata: Path) -> Tuple[Ledger, List[Change]]:
     """The repaired history and the days that change. Raises CacheError or LedgerError when it cannot be trusted."""
-    records, since, until = load_cursor_coverage(cursor_cache_path(userdata))
-    if not records or since is None or until is None:
+    account_records, since, until = load_cursor_coverage(cursor_cache_path(userdata))
+    if not account_records or since is None or until is None:
         raise CacheError("no Cursor usage in the cache: nothing to repair from")
-    fresh = {day: [r for r in rows if r.tool == TOOL]
-             for day, rows in live_days(dedupe([records]), load_rates(userdata)).items()}
+    # The records a freeze reads: the scan cache and the Cursor account cache, de-duplicated together.
+    records = [r for r in load_t3(userdata)[0] if r.provider == TOOL]
+    fresh = {day: [r for r in rows if r.tool == TOOL] for day, rows in live_days(records, load_rates(userdata)).items()}
     if ledger.start is None or not ledger.days:
         raise LedgerError("the history has no frozen days")
     last = max(ledger.days)
@@ -71,6 +74,9 @@ def repair_cursor(ledger: Ledger, userdata: Path) -> Tuple[Ledger, List[Change]]
         if _midnight_ms(day) < since or _midnight_ms(day + timedelta(days=1)) > until:
             raise CacheError("the Cursor cache does not cover %s in full (it covers %s to %s): not repaired"
                              % (day, _stamp(since), _stamp(until)))
+        if _sum(cursor_rows)[0] < _sum(current)[0]:
+            raise CacheError("the Cursor cache gives %s fewer tokens (%d) than the history holds (%d): not repaired"
+                             % (day, _sum(cursor_rows)[0], _sum(current)[0]))
         days[day] = kept + cursor_rows
         changes.append(Change(day, _sum(current), _sum(cursor_rows)))
     return Ledger(days, ledger.start), changes

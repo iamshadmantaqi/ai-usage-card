@@ -32,7 +32,8 @@ A day frozen while Cursor's usage was missing keeps that gap, because frozen day
 Cursor cache still holds those days, `python3 -m ai_usage_card --repair-cursor-history --dry-run` prints, per range of days, the
 Cursor tokens and cost the history holds and what the cache gives; without `--dry-run` it copies the history to
 `history.json.<timestamp>.bak` next to it and replaces only the `cursor` rows of those days. Other tools' rows are untouched, days the
-cache does not hold are left alone, and it refuses when the cache does not cover a day it would change. Running it twice changes nothing.
+cache does not hold are left alone, and it refuses (writing nothing) when any Cursor account in the cache, a lapsed one included, does not cover a day it
+would change, or when a day would end up with fewer Cursor tokens than the history holds. It reads the same records a freeze does. Running it twice changes nothing.
 
 ## Costs are API-equivalent
 

@@ -411,23 +411,21 @@ class CliHistoryTests(Base):
         self.assertIn("no source has recent usage", self.log())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class RepairCursorTests(Base):
     """`--repair-cursor-history` with literal numbers. Demo data: the cache holds two accounts covering 1 Oct 00:00 to
     10 Oct 00:00 Dhaka (rates: grok-4.6 input $2 and output $6 per million, so a record of 1000 input and 500 output
     tokens is 1500 tokens and costs 0.002 + 0.003 = $0.005 unless it reports its own cost)."""
 
-    def userdata(self, since=at(10, 1, 0), until=at(10, 10, 0), records=None):
+    def userdata(self, since=at(10, 1, 0), until=at(10, 10, 0), records=None, scan=None):
         strings = ["cursor-grok-4.6-high-fast", "agent-session"]
         a = [[at(10, 3, 12), 0, 1, 1000, 0, 0, 500, None, "cursor-account:a:1"]]  # 3 Oct: 1500 tokens, $0.005
         b = [[at(10, 3, 13), 0, 1, 2000, 0, 0, 1000, None, "cursor-account:b:1"],  # 3 Oct: 3000 tokens, $0.01
              [at(10, 4, 9), 0, 1, 1000, 0, 0, 500, 0.5, "cursor-account:b:2"]]  # 4 Oct: 1500 tokens, reported $0.5
         accounts = {n: {"accountKey": n, "sinceMs": since, "untilMs": until, "fetchedAtMs": until, "records": r}
                     for n, r in (("a", a), ("b", b))} if records is None else records
-        return fx.write_userdata(self.tmp / "userdata", scan={"version": 5, "sources": {}, "models": [], "sessions": [], "files": {}},
+        scan = scan if scan is not None else {"version": 5, "sources": {}, "models": [], "sessions": [], "files": {}}
+        return fx.write_userdata(self.tmp / "userdata", scan=scan,
                                  cursor={"version": 2, "strings": strings, "accounts": accounts})
 
     def saved(self, ledger):
@@ -512,3 +510,50 @@ class RepairCursorTests(Base):
         path = self.saved(self.ledger())
         with self.assertRaises(CacheError):
             self.run_repair(path, self.userdata(records={}))
+
+    def test_it_refuses_when_one_account_lapsed_before_a_day_it_would_change(self):
+        path = self.saved(self.ledger())
+        before = path.read_text()
+        accounts = {"a": {"accountKey": "a", "sinceMs": at(10, 1, 0), "untilMs": at(10, 3, 18), "fetchedAtMs": at(10, 3, 18),
+                          "records": [[at(10, 3, 12), 0, 1, 1000, 0, 0, 500, None, "cursor-account:a:1"]]},
+                    "b": {"accountKey": "b", "sinceMs": at(10, 1, 0), "untilMs": at(10, 10, 0), "fetchedAtMs": at(10, 10, 0),
+                          "records": [[at(10, 3, 13), 0, 1, 2000, 0, 0, 1000, None, "cursor-account:b:1"]]}}
+        with self.assertRaisesRegex(CacheError, "does not cover 2026-10-03 in full"):
+            self.run_repair(path, self.userdata(records=accounts))  # account a ends at 6 PM on 3 Oct
+        self.assertEqual(path.read_text(), before)
+        self.assertEqual(list(self.tmp.glob("*.bak")), [])
+
+    def test_it_refuses_a_day_that_would_lose_cursor_tokens(self):
+        ledger = self.ledger()
+        ledger.days[date(2026, 10, 3)][1] = Row("cursor", "cursor-grok-4.6-high-fast", 9000, 0.03)
+        path = self.saved(ledger)
+        before = path.read_text()
+        with self.assertRaisesRegex(CacheError, "2026-10-03 fewer tokens \\(4500\\) than the history holds \\(9000\\)"):
+            self.run_repair(path, self.userdata())
+        self.assertEqual(path.read_text(), before)
+        self.assertEqual(list(self.tmp.glob("*.bak")), [])
+
+    def test_cursor_records_in_the_scan_cache_count_as_they_do_in_a_freeze(self):
+        # 3 Oct, 8 AM: a Cursor row in the scan cache, 40 + 2 = 42 tokens of an unpriced model ($0)
+        scan = {"version": 5, "sources": {}, "models": fx.MODELS, "sessions": fx.SESSIONS,
+                "files": {"/f/x.jsonl": fx.entry("cursor", [fx.row(at(10, 3, 8), "tiny-1", 2, 40, 0, 0, 2, "cursor-local:1")])}}
+        path = self.saved(self.ledger())
+        self.run_repair(path, self.userdata(scan=scan))
+        self.assertEqual(history.load(path).days[date(2026, 10, 3)],
+                         [Row("claude", OPUS, 900, 9.0), Row("cursor", "cursor-grok-4.6-high-fast", 4500, 0.015), Row("cursor", "tiny-1", 42, 0.0)])
+
+    def test_the_command_line_flag_repairs_and_a_dry_run_writes_nothing(self):
+        path = self.saved(self.ledger())
+        before = path.read_text()
+        userdata = self.userdata()
+        now = datetime(2026, 11, 26, 9, 30, 15, tzinfo=TIMEZONE)
+        log = self.tmp / "card.log"
+        self.assertEqual(cli.main(["--repair-cursor-history", "--dry-run", "--history", str(path), "--userdata", str(userdata), "--log", str(log)], now), 0)
+        self.assertEqual(path.read_text(), before)
+        self.assertEqual(cli.main(["--repair-cursor-history", "--history", str(path), "--userdata", str(userdata), "--log", str(log)], now), 0)
+        self.assertEqual(history.load(path).days[date(2026, 10, 4)], [Row("codex", "gpt-6-luna", 50, 0.5), Row("cursor", "cursor-grok-4.6-high-fast", 1500, 0.5)])
+        self.assertTrue((self.tmp / "history.json.20261126T093015.bak").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
