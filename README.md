@@ -54,7 +54,7 @@ Before it reads T3 Code's cache, each run asks the T3 Code on this Mac to rescan
 2. The card calls T3 Code's `server.getUsageSummary` over its local WebSocket (`/ws`, the port from `~/.t3/userdata/server-runtime.json`) with that session. T3 Code answers when the scan is done (about 1 to 3 seconds on a warm cache) and saves its cache as it answers, so the card waits up to 15 seconds for the cache file to change before reading it; a scan that found nothing new saves nothing, and the card then reads the cache as it is.
 3. `t3 auth session revoke` removes the session at once.
 
-The session token stays in memory for those few seconds: it is never written to a file or the log. If T3 Code is not running, its command is missing, it refuses, it answers in a form the card does not know (a T3 update can change this private interface) it sends a reply over 16 MB, or it takes over 3 minutes, the run logs one warning and reads the cache as it is. `--no-t3-refresh` skips the step. The call was checked against T3 Code 0.1.12 (November 2026); `ai_usage_card/refresh.py` has the details.
+The session token stays in memory for those few seconds: it is never written to a file or the log. If T3 Code is not running, its command is missing, it refuses, it answers in a form the card does not know (a T3 update can change this private interface), it sends a reply over 16 MB, or it takes over 3 minutes, the run logs one warning and reads the cache as it is. `--no-t3-refresh` skips the step. The call was checked against T3 Code 0.1.12 (November 2026); `ai_usage_card/refresh.py` has the details.
 
 ## It refuses to publish when
 
