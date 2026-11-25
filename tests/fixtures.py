@@ -68,12 +68,30 @@ def scan_cache_v9():
     return cache
 
 
+def scan_cache_v17(version=17):
+    """The layout T3 writes at version 17: `coveredSince` at the top, `mt` beside `mr`, and Claude and Codex
+    rows fourteen wide (null service tier turn id, then the cache creation written with the 1-hour lifetime).
+    Same usage figures as `scan_cache()`. Demo data only."""
+    cache = scan_cache(version=version)
+    cache["sources"] = {"claude\0/demo/projects": {"dir": "/demo/projects"}}
+    cache["coveredSince"] = {"claude\0/demo/projects": ms(8, 1, 0)}
+    for file_entry in cache["files"].values():
+        file_entry["mr"] = 0
+    cache["files"]["/f/a.jsonl"]["r"] = [A1 + [None, 600], A2 + [None, 0], A3 + [None, 0], A4 + [None, 0], A5 + [None, 0]]
+    cache["files"]["/f/b.jsonl"]["r"] = [A1 + [None, 600], B1 + [None, 0]]
+    cache["files"]["/f/b.jsonl"]["mr"] = 1
+    cache["files"]["/f/b.jsonl"]["mt"] = [ms(10, 17, 13)]
+    cache["files"]["/f/c.jsonl"]["r"] = [CODEX + [None, 0]]
+    cache["files"]["/f/d.jsonl"]["r"] = [CODEX + [None, 0]]
+    return cache  # grok's rows stay twelve wide
+
+
 def cursor_cache():
     strings = ["cursor-grok-4.6-high-fast", "agent-session"]
     # 3500 tokens; reported $0.0123 replaces the list price of $0.009
     rows = [[ms(10, 18, 3), 0, 1, 1000, 2000, 0, 500, 0.0123, "cursor-account:k:1:0"]]
-    return {"version": 1, "strings": strings, "accounts": {"keychain": {
-        "accountKey": "k", "sinceMs": 0, "untilMs": MTIME, "fetchedAtMs": 1, "records": rows}}}
+    return {"version": 2, "strings": strings, "accounts": {"keychain": {
+        "accountKey": "k", "sinceMs": 0, "untilMs": MTIME, "fetchedAtMs": MTIME, "records": rows}}}
 
 
 def rates():
@@ -89,11 +107,12 @@ def rates():
     }}
 
 
-def write_userdata(folder: Path, scan=None, cursor=None, rate_table=None, cursor_enabled=True, scan_version=5) -> Path:
+def write_userdata(folder: Path, scan=None, cursor=None, rate_table=None, scan_version=5, cursor_version=2) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "settings.json").write_text(json.dumps({"cursorKeychainUsageEnabled": cursor_enabled}))
     (folder / ("usage-scan-cache-v%d.json" % scan_version)).write_text(json.dumps(scan if scan is not None else scan_cache(scan_version)))
-    (folder / "usage-cursor-account-cache-v1.json").write_text(json.dumps(cursor if cursor is not None else cursor_cache()))
+    if cursor is not False:  # cursor=False: no Cursor login, no file
+        document = cursor if cursor is not None else cursor_cache()
+        (folder / ("usage-cursor-account-cache-v%d.json" % cursor_version)).write_text(json.dumps(dict(document, version=cursor_version)))
     (folder / "usage-model-rates.json").write_text(json.dumps(rate_table if rate_table is not None else rates()))
     return folder
 
