@@ -90,8 +90,8 @@ def cursor_cache():
     strings = ["cursor-grok-4.6-high-fast", "agent-session"]
     # 3500 tokens; reported $0.0123 replaces the list price of $0.009
     rows = [[ms(10, 18, 3), 0, 1, 1000, 2000, 0, 500, 0.0123, "cursor-account:k:1:0"]]
-    return {"version": 1, "strings": strings, "accounts": {"keychain": {
-        "accountKey": "k", "sinceMs": 0, "untilMs": MTIME, "fetchedAtMs": 1, "records": rows}}}
+    return {"version": 2, "strings": strings, "accounts": {"keychain": {
+        "accountKey": "k", "sinceMs": 0, "untilMs": MTIME, "fetchedAtMs": MTIME, "records": rows}}}
 
 
 def rates():
@@ -107,11 +107,12 @@ def rates():
     }}
 
 
-def write_userdata(folder: Path, scan=None, cursor=None, rate_table=None, cursor_enabled=True, scan_version=5) -> Path:
+def write_userdata(folder: Path, scan=None, cursor=None, rate_table=None, scan_version=5, cursor_version=2) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "settings.json").write_text(json.dumps({"cursorKeychainUsageEnabled": cursor_enabled}))
     (folder / ("usage-scan-cache-v%d.json" % scan_version)).write_text(json.dumps(scan if scan is not None else scan_cache(scan_version)))
-    (folder / "usage-cursor-account-cache-v1.json").write_text(json.dumps(cursor if cursor is not None else cursor_cache()))
+    if cursor is not False:  # cursor=False: no Cursor login, no file
+        document = cursor if cursor is not None else cursor_cache()
+        (folder / ("usage-cursor-account-cache-v%d.json" % cursor_version)).write_text(json.dumps(dict(document, version=cursor_version)))
     (folder / "usage-model-rates.json").write_text(json.dumps(rate_table if rate_table is not None else rates()))
     return folder
 
