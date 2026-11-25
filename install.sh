@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install the daily card job on this Mac. Safe to run again: it replaces the previous install.
-#   ./install.sh            install and load the job (runs daily at 06:00)
+#   ./install.sh            install and load the job (runs daily, at the time in the launchd template)
 #   ./install.sh --kickstart  also run it once now, through launchd, and show the log
 set -euo pipefail
 
@@ -18,17 +18,16 @@ rm -rf "$APP_DIR/ai_usage_card"
 cp -R "$HERE/ai_usage_card" "$APP_DIR/ai_usage_card"
 find "$APP_DIR" -name __pycache__ -prune -exec rm -rf {} +
 
-# macOS cannot grant Full Disk Access to the /usr/bin/python3 shim, and without it the job cannot read
-# Claude Code's transcripts. The grant goes to the Command Line Tools Python.app, so the job runs that.
-PYTHON="$(/usr/bin/python3 -c 'import sys; print(sys.base_prefix)')/Resources/Python.app/Contents/MacOS/Python"
-if [ ! -x "$PYTHON" ]; then
-  echo "Warning: $PYTHON not found; the job will use /usr/bin/python3, which cannot be given Full Disk Access." >&2
-  PYTHON=/usr/bin/python3
-fi
+# launchd starts the Command Line Tools Python.app itself, so its Full Disk Access grant applies. The path
+# goes through Versions/Current, so a Command Line Tools update cannot leave it pointing at a missing binary.
+PYTHON="$("$HERE/launchd/find-python.sh")"
 
 sed -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@LOG_FILE@|$LOG_FILE|g" -e "s|@PYTHON@|$PYTHON|g" \
   "$HERE/launchd/$LABEL.plist.template" > "$PLIST"
 plutil -lint "$PLIST" >/dev/null
+# The schedule is the plist's; show it as Bangladesh time rather than as the raw hour and minute.
+# Only the message needs it, so a failure here must not stop the install.
+RUN_TIME="$(bash "$HERE/launchd/run-time.sh" "$PLIST")" || RUN_TIME="the time set in $PLIST"
 
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 # bootout returns before the job is gone, and bootstrapping the same label too soon fails.
@@ -37,7 +36,7 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 launchctl bootstrap "$DOMAIN" "$PLIST"
-echo "Installed $LABEL (daily at 06:00). Log: $LOG_FILE"
+echo "Installed $LABEL (daily at $RUN_TIME). Log: $LOG_FILE"
 echo "The job runs: $PYTHON"
 echo "It needs Full Disk Access: System Settings > Privacy & Security > Full Disk Access > +, Cmd+Shift+G, then the path above."
 
