@@ -58,7 +58,7 @@ The session token stays in memory for those few seconds: it is never written to 
 
 ## It refuses to publish when
 
-- the cache is missing, unparsable or older than version 5 (T3 writes each version to its own file and deletes the older ones, so the newest file is read), or a version newer than 17 (the last one checked against T3's source) has files or rows this card cannot read. A newer version whose files and rows still match is read with a warning in the log; check it against T3's source then and raise `SCAN_CACHE_CHECKED_THROUGH` in `load.py`;
+- the cache is missing, unparsable or older than version 5 (T3 writes each version to its own file and deletes the older ones; when an older T3 leaves two, the file saved last is read), or a version newer than 17 (the last one checked against T3's source) has files or rows this card cannot read, or rows wider than version 17's. A newer version whose files and rows still match is read with a warning in the log; check it against T3's source then and raise `SCAN_CACHE_CHECKED_THROUGH` in `load.py`;
 - the newest record from any source is older than 48 hours (a stale T3 Code cache alone only logs a warning);
 - no Claude Code transcripts folder exists, a transcripts folder or file cannot be read, or T3 Code has Claude Code usage in the window while the transcripts give none;
 - the history file is damaged (see above);
