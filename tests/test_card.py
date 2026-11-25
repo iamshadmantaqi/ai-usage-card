@@ -14,9 +14,10 @@ from unittest import mock
 
 from ai_usage_card import cli, history, publish
 from ai_usage_card.claude import _timestamp_ms, load_claude_records, transcript_files
-from ai_usage_card.load import CacheError, load_records, load_t3
+from ai_usage_card.load import CacheError, claude_reply_key, load_records, load_t3
 from ai_usage_card.pricing import load_rates, parse_rate_table, price
 from ai_usage_card.privacy import PrivacyError, check_privacy
+from ai_usage_card.refresh import Rescan
 from ai_usage_card.render import DARK, LIGHT, fmt_cost, fmt_tokens, render, render_phone
 from ai_usage_card.summarise import summarise
 from tests import fixtures as fx
@@ -423,6 +424,7 @@ class ClaudeFromT3Tests(Case):
     must give the same numbers: X 5100 tokens $0.0169, Y 170 $0.00055, F 300 $0.0022, and the 1 Aug reply 2 tokens."""
 
     LIVE_SINCE = date(2026, 9, 18)  # 30 days before 18 Oct: the oldest day a full history leaves live
+    CLEAN = Rescan(saved=True, claude_trouble=None)
 
     @staticmethod
     def utc(month, day, hour):
@@ -454,9 +456,9 @@ class ClaudeFromT3Tests(Case):
             old.unlink()
         fx.write_userdata(self.userdata, scan=scan, scan_version=17)
 
-    def gather(self, live_since):
+    def gather(self, live_since, rescan=CLEAN):
         with self.assertLogs("ai-usage-card", "INFO") as logs:
-            records, _ = cli.gather(self.userdata, self.projects, fx.NOW, live_since)
+            records, _ = cli.gather(self.userdata, self.projects, fx.NOW, rescan, live_since)
         return sorted(r.tokens.total for r in records if r.provider == "claude"), "\n".join(logs.output), records
 
     def test_t3_rows_give_the_same_tokens_and_cost_as_the_transcripts(self):
@@ -469,7 +471,7 @@ class ClaudeFromT3Tests(Case):
         self.assertEqual((x.tokens.output, x.tokens.cache_creation_1h, x.timestamp_ms), (3000, 600, self.utc(10, 17, 6)))
         self.assertEqual({r.reported_cost_usd for r in records if r.provider == "claude"}, {None})  # F's reported $9 is dropped
         from_t3 = summarise(records, load_rates(self.userdata), TODAY)
-        transcripts, _, _ = self.gather(None)
+        transcripts, _, _ = self.gather(self.LIVE_SINCE, None)
         self.assertEqual(transcripts, [2, 170, 300, 5100])
         from_transcripts = summarise(cli.gather(self.userdata, self.projects, fx.NOW)[0], load_rates(self.userdata), TODAY)
         for s in (from_t3, from_transcripts):
@@ -485,7 +487,13 @@ class ClaudeFromT3Tests(Case):
     def test_falls_back_to_the_transcripts_with_the_reason(self):
         folder, elsewhere = str(self.projects), str(self.tmp / "elsewhere")
         cases = [
-            (None, self.t3_scan(), "T3 Code did not rescan"),
+            (self.LIVE_SINCE, self.t3_scan(), "T3 Code did not rescan", None),
+            (self.LIVE_SINCE, self.t3_scan(), "T3 Code's cache did not change after its rescan, so it may be older than the rescan",
+             Rescan(saved=False, claude_trouble=None)),
+            (self.LIVE_SINCE, self.t3_scan(), "T3 Code did not read a Claude Code folder in full (status partial)",
+             Rescan(saved=True, claude_trouble="T3 Code did not read a Claude Code folder in full (status partial)")),
+            (None, self.t3_scan(), "T3 Code's scan of a Claude Code folder starts 2026-08-01, and the card needs it from 2026-04-20",
+             self.CLEAN),  # no history yet: the whole window is live
             (self.LIVE_SINCE, self.t3_scan(covered={"claude\0" + folder: fx.ms(9, 20, 0)}),
              "T3 Code's scan of a Claude Code folder starts 2026-09-20, and the card needs it from 2026-09-18"),
             (self.LIVE_SINCE, self.t3_scan(covered={}), "T3 Code's scan of a Claude Code folder has no start, and the card needs it from 2026-09-18"),
@@ -494,10 +502,11 @@ class ClaudeFromT3Tests(Case):
              "T3 Code does not scan the Claude Code folder given to the card"),
             (self.LIVE_SINCE, self.t3_scan(sources={}), "T3 Code scans no Claude Code folder"),
         ]
-        for live_since, scan, reason in cases:
+        for case in cases:
+            live_since, scan, reason, rescan = case if len(case) == 4 else case + (self.CLEAN,)
             with self.subTest(reason):
                 self.use(scan)
-                totals, log, _ = self.gather(live_since)
+                totals, log, _ = self.gather(live_since, rescan)
                 self.assertIn("Claude Code read from its transcripts: " + reason, log)
                 self.assertEqual(totals, [2, 170, 300, 5100])
 
@@ -516,13 +525,57 @@ class ClaudeFromT3Tests(Case):
         self.assertEqual((x.tokens.uncached, x.tokens.cached, x.tokens.cache_creation, x.tokens.output, x.timestamp_ms),
                          (100, 1000, 1000, 3000, self.utc(10, 17, 6)))
 
-    def test_build_asks_for_the_first_live_day_only_after_a_rescan(self):
+    def test_build_passes_the_rescan_and_the_first_live_day(self):
         self.use(self.t3_scan())
         with mock.patch.object(cli, "gather", wraps=cli.gather) as gathered:
-            cli.build(self.userdata, fx.NOW, self.projects, None, True)
+            cli.build(self.userdata, fx.NOW, self.projects, None, self.CLEAN)
             cli.build(self.userdata, fx.NOW, self.projects)
         # no history yet: every day of the window is live, back to 20 Apr, which T3's scan (from 1 Aug) does not reach
-        self.assertEqual([c[0][3] for c in gathered.call_args_list], [date(2026, 4, 20), None])
+        self.assertEqual([c[0][3:] for c in gathered.call_args_list],
+                         [(self.CLEAN, date(2026, 4, 20)), (None, date(2026, 4, 20))])
+
+    def test_a_reply_is_counted_once_per_message_id_on_both_paths(self):
+        # The 16 November case: a second copy of a reply written without its request id. T3 keys it
+        # `msg_x:` beside `msg_x:req_x` and counts it twice; Anthropic bills the message once.
+        scan = self.t3_scan()
+        copy = list(scan["files"]["/f/chat2.jsonl"]["r"][0])
+        copy[8] = "msg_x:"
+        scan["files"]["/f/chat2.jsonl"]["r"].append(copy)
+        self.use(scan)
+        totals, _, _ = self.gather(self.LIVE_SINCE)
+        self.assertEqual(totals, [2, 170, 300, 5100])
+        line = {"type": "assistant", "timestamp": "2026-10-17T06:00:00.123Z",
+                "message": {"id": "msg_x", "model": "claude-opus-5-5", "usage": {
+                    "input_tokens": 100, "cache_read_input_tokens": 1000, "output_tokens": 3000,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 400, "ephemeral_1h_input_tokens": 600}}}}
+        with open(next(self.projects.rglob("*.jsonl")), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(line) + "\n")
+        transcripts, _, _ = self.gather(self.LIVE_SINCE, None)
+        self.assertEqual(transcripts, [2, 170, 300, 5100])
+
+    def test_claude_keys_keep_the_message_id_alone(self):
+        self.assertEqual([claude_reply_key(k) for k in ("msg_a:req_a", "msg_a:", ":req_b", "msg_a:req_a:advisor:2", "msg_a::advisor:0")],
+                         ["claude:m:msg_a", "claude:m:msg_a", "claude:r:req_b", "claude:m:msg_a:advisor:2", "claude:m:msg_a:advisor:0"])
+
+    def test_transcript_copies_keep_each_figures_largest_and_advisor_parts_count(self):
+        def line(ts, output, cache_read, iterations=None):
+            usage = {"input_tokens": 10, "cache_read_input_tokens": cache_read, "output_tokens": output}
+            if iterations is not None:
+                usage["iterations"] = iterations
+            return json.dumps({"type": "assistant", "timestamp": ts, "requestId": "req_q",
+                               "message": {"id": "msg_q", "model": "claude-opus-5-5", "usage": usage}})
+        advisor = {"type": "advisor_message", "model": "claude-sonnet-5-5", "input_tokens": 7, "output_tokens": 3}
+        folder = self.tmp / "q"
+        folder.mkdir()
+        (folder / "q.jsonl").write_text("\n".join([
+            line("2026-10-17T05:00:00Z", 5, 900),
+            line("2026-10-17T05:00:09Z", 40, 0, [{"type": "message"}, advisor]),  # a later copy with less cache read
+        ]) + "\n")
+        five = int(datetime(2026, 10, 17, 5, tzinfo=timezone.utc).timestamp() * 1000)
+        records = load_claude_records([folder])
+        # the reply keeps its first copy's time, its largest cache read (900) and its largest output (40)
+        self.assertEqual(sorted((r.model, r.tokens.uncached, r.tokens.cached, r.tokens.output, r.timestamp_ms) for r in records),
+                         [("claude-opus-5-5", 10, 900, 40, five), ("claude-sonnet-5-5", 7, 0, 3, five + 9000)])
 
     def test_the_first_live_day_follows_the_history(self):
         from ai_usage_card.history import Ledger, Row

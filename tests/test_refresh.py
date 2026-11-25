@@ -185,6 +185,7 @@ class RefreshTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertIn("T3 Code rescanned its usage", text)
         self.assertIn("(3 sources); its cache was saved", text)
+        self.assertEqual(result, refresh.Rescan(True, "T3 Code's answer lists no Claude Code folder"))  # the fake lists Codex only
         self.assertTrue((self.userdata / "usage-scan-cache-v17.json").exists())
         self.assertEqual(server.after_reply, [(0xA, b"ping"), (0x8, struct.pack("!H", 1000))])  # the pong, then a close
         self.assertEqual(run.verbs, ["issue", "revoke"])
@@ -196,6 +197,23 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(server.request["payload"], {"sinceDay": "2026-09-18", "untilDay": "2026-10-18",
                                                      "timeZone": "Asia/Dhaka", "awaitRefresh": True})
 
+    def test_the_answer_says_whether_every_claude_folder_was_read_in_full(self):
+        claude = lambda **extra: dict({"fingerprint": {"provider": "claude", "resolvedHomePath": "/demo/projects"}, "status": "ok"}, **extra)
+        codex = {"fingerprint": {"provider": "codex"}, "status": "partial"}
+        cases = [
+            ([claude(), codex], None),
+            ([claude(), claude(status="missing")], None),
+            ([codex], "T3 Code's answer lists no Claude Code folder"),
+            ([claude(), claude(status="partial")], "T3 Code did not read a Claude Code folder in full (status partial)"),
+            ([claude(status="error")], "T3 Code did not read a Claude Code folder in full (status error)"),
+            ([claude(status="/private/odd")], "T3 Code did not read a Claude Code folder in full (status unknown)"),
+            ([claude(refreshing=True)], "T3 Code answered while it was still reading a Claude Code folder"),
+        ]
+        for sources, trouble in cases:
+            with self.subTest(trouble):
+                self.assertEqual(refresh.claude_trouble({"sources": sources}), trouble)
+        self.assertEqual(refresh.claude_trouble({}), "T3 Code's answer lists no Claude Code folder")
+
     def test_a_rescan_that_saves_nothing_new_waits_only_so_long(self):
         (self.userdata / "usage-scan-cache-v17.json").write_text("{}")
         self.start(saves=False)
@@ -205,6 +223,7 @@ class RefreshTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertLess(time.monotonic() - started, 4)
         self.assertIn("(3 sources); its cache did not change within 0s", text)
+        self.assertEqual(result, refresh.Rescan(False, "T3 Code's answer lists no Claude Code folder"))
 
     def test_t3_not_running_falls_back_without_calling_its_command(self):
         run = FakeCli()
@@ -366,12 +385,13 @@ class CliRefreshTests(unittest.TestCase):
             seen.append(args[4])
             return real_build(*args, **kwargs)
 
+        clean = refresh.Rescan(saved=True, claude_trouble=None)
         with mock.patch.object(cli, "build", side_effect=build):
-            for answered in (True, False):
+            for answered in (clean, None):
                 with mock.patch.object(cli, "refresh_t3_usage", return_value=answered):
                     self.assertEqual(self.run_cli(), 0)
             self.assertEqual(self.run_cli("--no-t3-refresh"), 0)  # T3 Code is not running here, so it is not asked
-        self.assertEqual(seen, [True, False, False])
+        self.assertEqual(seen, [clean, None, None])
         # the fixture's version 5 cache records no scanned Claude folder, so even after a rescan the transcripts are read
         self.assertIn("Claude Code read from its transcripts: T3 Code scans no Claude Code folder", (self.tmp / "card.log").read_text())
 

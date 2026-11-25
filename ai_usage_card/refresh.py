@@ -19,6 +19,11 @@ The call, as T3 Code 0.1.12 serves it (checked against its bundled server in Nov
 The token lives only in this process: it is never written to disk or to the log. Every failure (T3 Code not
 running, an older or newer T3 that answers differently, a timeout) is logged as one warning and the card
 reads the cache as it is, which is what it did before this step existed.
+
+The answer lists each folder T3 read, with a `status` (`ok`, `missing` for a folder that is not there,
+`partial` when a file could not be read or a line was malformed, `error`) and `refreshing: true` when T3
+answered from memory while it still reads. Claude Code is taken from T3's cache only when T3 saved the cache
+after this rescan and read every Claude Code folder cleanly (`Rescan`); otherwise the card reads the transcripts.
 """
 from __future__ import annotations
 
@@ -33,7 +38,7 @@ import subprocess
 import time
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, NamedTuple, Optional
 
 log = logging.getLogger("ai-usage-card")
 
@@ -58,14 +63,43 @@ class RefreshError(Exception):
     """T3 Code did not rescan. The message never carries the token."""
 
 
+class Rescan(NamedTuple):
+    """A rescan T3 Code answered. `saved`: T3 saved its scan cache afterwards (a scan that found nothing new saves
+    nothing, and a save that lands after the wait is not seen, so the cache read may then be older than the scan).
+    `claude_trouble`: why T3's answer shows a Claude Code folder not read in full, None when every one was."""
+    saved: bool
+    claude_trouble: Optional[str]
+
+
+CLEAN_STATUSES = ("ok", "missing")  # `missing`: the folder is not there, so it has nothing to count either way
+
+
+def claude_trouble(summary: Dict[str, Any]) -> Optional[str]:
+    """Why the Claude Code folders in T3's answer cannot all be trusted, or None. The status is quoted only when it is
+    one T3 is known to send, so nothing else from T3's answer reaches the log."""
+    sources = summary.get("sources")
+    claude = [s for s in (sources if isinstance(sources, list) else [])
+              if isinstance(s, dict) and isinstance(s.get("fingerprint"), dict) and s["fingerprint"].get("provider") == "claude"]
+    if not claude:
+        return "T3 Code's answer lists no Claude Code folder"
+    for source in claude:
+        if source.get("refreshing") is True:
+            return "T3 Code answered while it was still reading a Claude Code folder"
+        status = source.get("status")
+        if status not in CLEAN_STATUSES:
+            return "T3 Code did not read a Claude Code folder in full (status %s)" % (
+                status if status in ("partial", "error") else "unknown")
+    return None
+
+
 def default_cli(userdata: Path) -> Path:
     """The `t3` command T3 Code installs in its home folder (the parent of `userdata`)."""
     return userdata.parent / "bin" / "t3"
 
 
 def refresh_t3_usage(userdata: Path, today: date, timezone: str, cli: Optional[Path] = None,
-                     run: Runner = subprocess.run, timeout_s: float = SCAN_TIMEOUT_S) -> bool:
-    """Asks T3 Code to rescan the last `SCAN_DAYS` days. True when it answered; False, with a warning in the
+                     run: Runner = subprocess.run, timeout_s: float = SCAN_TIMEOUT_S) -> Optional[Rescan]:
+    """Asks T3 Code to rescan the last `SCAN_DAYS` days. A `Rescan` when it answered; None, with a warning in the
     log, when it could not be asked or did not answer. Never raises."""
     started = time.monotonic()
     try:
@@ -86,13 +120,13 @@ def refresh_t3_usage(userdata: Path, today: date, timezone: str, cli: Optional[P
         log.info("T3 Code rescanned its usage in %.1fs (%d sources); %s", time.monotonic() - started,
                  len(summary.get("sources") or []),
                  "its cache was saved" if saved else "its cache did not change within %.0fs" % SAVE_WAIT_S)
-        return True
+        return Rescan(saved, claude_trouble(summary))
     except RefreshError as error:
         reason = str(error)
     except Exception as error:  # a refresh must never stop the card
         reason = "%s" % type(error).__name__
     log.warning("T3 Code was not asked to rescan its usage (%s); reading its cache as it is", reason)
-    return False
+    return None
 
 
 def _cache_stamp(userdata: Path):

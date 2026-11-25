@@ -397,13 +397,24 @@ def _merge_copies(held: UsageRecord, copy: UsageRecord) -> UsageRecord:
                        max(costs) if costs else None, held.speed, held.dedupe_key)
 
 
+def claude_reply_key(key: str) -> str:
+    """The key a Claude Code reply is counted once under, from T3's `<message id>:<request id>` (with
+    `:advisor:<n>` after it for an advisor's part of the reply). A message id names one API response, which is what
+    Anthropic bills, and a copy of a reply can be written without its request id (one Haiku reply on 16 November
+    2026, which T3 counts twice), so the message id is the key on its own and the request id only stands in when
+    there is no message id, as `claude.py` keys the transcripts."""
+    message, _, rest = key.partition(":")
+    request, _, part = rest.partition(":")
+    return "claude:" + ("m:" + message if message else "r:" + request) + (":" + part if part else "")
+
+
 def dedupe(per_file: List[List[UsageRecord]]) -> List[UsageRecord]:
     """Global de-duplication by dedupe key, as T3's aggregator does: the first copy is kept, and for Claude
-    Code each token figure is the largest of its copies.
+    Code each token figure is the largest of its copies, counted once per message id (`claude_reply_key`).
 
     Claude Code writes a reply several times while it streams (only the last copy has the final output) and
-    copies a message's records forward when a session is resumed or forked, so the same
-    `message.id:requestId` key legitimately appears several times, within a transcript and across them.
+    copies a message's records forward when a session is resumed or forked, so the same message id
+    legitimately appears several times, within a transcript and across them.
     """
     shared = _shared_sessions(per_file)
     seen = {}  # type: Dict[str, int]
@@ -417,6 +428,8 @@ def dedupe(per_file: List[List[UsageRecord]]) -> List[UsageRecord]:
                 identity = (record.provider, record.session_id, record.timestamp_ms, record.model, t)
                 occurrences[identity] = occurrences.get(identity, 0) + 1
                 key = _shared_session_key(record, occurrences[identity])
+            elif record.provider == "claude" and key is not None:
+                key = claude_reply_key(key)
             if key is not None:
                 if key in seen:
                     if record.provider == "claude":

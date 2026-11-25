@@ -21,12 +21,12 @@ from .claude import PROJECTS_DIR, load_claude_records
 from .load import CacheError, UsageRecord, load_t3
 from .pricing import load_rates
 from .privacy import PrivacyError, check_privacy
-from .refresh import refresh_t3_usage
+from .refresh import Rescan, refresh_t3_usage
 from .history import Ledger, LedgerError
 from .repair import run as repair_cursor_history
 from .render import DARK, LIGHT, fmt_cost, fmt_tokens, period_label, render, render_phone
 from .summarise import (FREEZE_AFTER_DAYS, TIMEZONE, first_live_day, freeze, last_frozen_day, local_day, summarise,
-                        window_start_ms)
+                        window_first, window_start_ms)
 
 HOME = Path.home()
 DEFAULT_USERDATA = HOME / ".t3" / "userdata"
@@ -50,9 +50,18 @@ class Refused(Exception):
         self.history = history
 
 
-def _t3_claude_gap(projects: Path, coverage: Dict[str, Optional[int]], live_since: date) -> Optional[str]:
-    """Why T3 Code's Claude Code records cannot stand in for the transcripts, or None when they can: T3 scans
-    `projects` and has read every Claude folder it scans back to the start of `live_since` (BD time)."""
+def _t3_claude_gap(rescan: Optional[Rescan], projects: Path, coverage: Dict[str, Optional[int]],
+                   live_since: date) -> Optional[str]:
+    """Why T3 Code's Claude Code records cannot stand in for the transcripts, or None when they can: T3 has just
+    rescanned, saved its cache and read every Claude folder cleanly (`rescan`), it scans `projects`, and its cache
+    holds every Claude folder it scans back to the start of `live_since` (BD time). `coveredSince` only ever moves
+    back, so it says how far the cache reaches, not that this scan read everything: the rescan's answer says that."""
+    if rescan is None:
+        return "T3 Code did not rescan"
+    if not rescan.saved:
+        return "T3 Code's cache did not change after its rescan, so it may be older than the rescan"
+    if rescan.claude_trouble is not None:
+        return rescan.claude_trouble
     if not coverage:
         return "T3 Code scans no Claude Code folder"
     if os.path.realpath(str(projects)) not in {os.path.realpath(folder) for folder in coverage}:
@@ -65,15 +74,15 @@ def _t3_claude_gap(projects: Path, coverage: Dict[str, Optional[int]], live_sinc
     return None
 
 
-def gather(userdata: Path, projects: Path, now: datetime,
+def gather(userdata: Path, projects: Path, now: datetime, rescan: Optional[Rescan] = None,
            claude_live_since: Optional[date] = None) -> Tuple[List[UsageRecord], Optional[int]]:
     """Records for the window, and the time both of T3 Code's caches are complete up to (None if they cover
     nothing): the older of the scan cache's newest record and Cursor's `untilMs`, so one fresh cache cannot hide
     the other being stale.
 
-    Claude Code comes from T3's scan cache when `claude_live_since` is given (T3 has just rescanned) and T3 has
-    read every Claude folder it scans, `projects` among them, back to that day, the first day the card takes
-    from live records; T3 17 counts Claude Code as the transcripts do (`claude.py`). Otherwise it comes from
+    Claude Code comes from T3's scan cache when `_t3_claude_gap` finds nothing in the way: `rescan` is this run's
+    answered rescan and `claude_live_since` the first day the card takes from live records (the window's first
+    day when it is None); T3 17 counts Claude Code as the transcripts do (`claude.py`). Otherwise it comes from
     the transcripts, read from `projects` and from every Claude folder T3 scans, with T3's Claude records
     dropped so nothing is counted twice, and one log line says why. Everything else stays on T3's caches. On
     the transcript read, refuses when T3 has Claude usage in the window and the transcripts give none, which
@@ -88,7 +97,8 @@ def gather(userdata: Path, projects: Path, now: datetime,
     t3 = [r for r in t3_records if in_range(r)]
     scan_newest = max((r.timestamp_ms for r in t3 if r.provider != "cursor"), default=None)
     t3_newest = scan_newest if cursor_until is None or scan_newest is None else min(scan_newest, cursor_until)
-    gap = "T3 Code did not rescan" if claude_live_since is None else _t3_claude_gap(projects, coverage, claude_live_since)
+    live_since = claude_live_since or window_first(now.astimezone(TIMEZONE).date())
+    gap = _t3_claude_gap(rescan, projects, coverage, live_since)
     if gap is None:
         log.info("Claude Code read from T3 Code's scan cache")
         # A reported cost is dropped, so Claude Code is priced exactly as the transcript read prices it.
@@ -101,26 +111,26 @@ def gather(userdata: Path, projects: Path, now: datetime,
 
 
 def build_cards(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: Optional[Ledger] = None,
-                t3_rescanned: bool = False) -> Dict[str, str]:
+                rescan: Optional[Rescan] = None) -> Dict[str, str]:
     """The four SVGs, without the history that was frozen on the way (see `build`)."""
-    return build(userdata, now, projects, ledger, t3_rescanned)[0]
+    return build(userdata, now, projects, ledger, rescan)[0]
 
 
 def build(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: Optional[Ledger] = None,
-          t3_rescanned: bool = False) -> Tuple[Dict[str, str], Ledger]:
+          rescan: Optional[Rescan] = None) -> Tuple[Dict[str, str], Ledger]:
     """The four SVGs (wide and phone, light and dark) and the history with any newly frozen days, or
     Refused / CacheError / PrivacyError. Pure of side effects except reading: the caller saves the history.
 
     The window is six months and ends today; days 30 or more days old come from `ledger` once frozen. T3 Code
-    saves its usage cache only when its usage page is open or `main` has asked it to rescan (`t3_rescanned`, which
-    lets Claude Code come from that cache, see `gather`; without it Claude Code is read from its transcripts, so
+    saves its usage cache only when its usage page is open or `main` has asked it to rescan (`rescan`, which
+    can let Claude Code come from that cache, see `gather`; without it Claude Code is read from its transcripts, so
     it is always current), so a stale T3 cache costs the other tools their recent days, which is logged as a
     warning."""
     now_ms = int(now.timestamp() * 1000)
     max_age_ms = MAX_RECORD_AGE.total_seconds() * 1000
     ledger = ledger or Ledger.empty()
     rates, today = load_rates(userdata), now.astimezone(TIMEZONE).date()
-    records, t3_newest = gather(userdata, projects, now, first_live_day(ledger, today) if t3_rescanned else None)
+    records, t3_newest = gather(userdata, projects, now, rescan, first_live_day(ledger, today))
     if not records:
         raise Refused("no usage records found")
     newest_ms = max(r.timestamp_ms for r in records)
@@ -195,15 +205,15 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
             print(text)
             return 0
         saved = ledger_file.load(history_path)  # a corrupt file refuses the run here, before anything can overwrite it
-        rescanned = False
+        rescan = None  # type: Optional[Rescan]
         if not args.no_t3_refresh:
             # Codex, Grok and the other tools are only as fresh as T3's scan cache; a failure here only logs a warning,
             # and Claude Code is then read from its transcripts.
             today = (now or datetime.now(TIMEZONE)).astimezone(TIMEZONE).date()
-            rescanned = refresh_t3_usage(args.userdata, today, getattr(TIMEZONE, "key", "Asia/Dhaka"))
+            rescan = refresh_t3_usage(args.userdata, today, getattr(TIMEZONE, "key", "Asia/Dhaka"))
         now = now or datetime.now(TIMEZONE)  # taken after the refresh, which can take a few minutes
         try:
-            cards, frozen = build(args.userdata, now, args.claude_projects, saved, rescanned)
+            cards, frozen = build(args.userdata, now, args.claude_projects, saved, rescan)
         except Refused as error:
             if error.history is None:
                 raise

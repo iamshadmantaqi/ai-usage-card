@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
-from .load import CacheError, Tokens, UsageRecord, _num
+from .load import CacheError, Tokens, UsageRecord, _merge_copies, _num
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 _FRACTION = re.compile(r"\.(\d+)")
@@ -94,42 +94,55 @@ def transcript_files(roots: Iterable[Path], min_mtime_ms: float = 0) -> Iterator
                 yield path
 
 
-def _record_from_line(line: str) -> Optional[Tuple[Tuple[Any, ...], UsageRecord]]:
-    try:
-        row = json.loads(line)
-    except ValueError:
-        return None
-    if not isinstance(row, dict) or row.get("type") != "assistant":
-        return None
-    message = row.get("message")
-    usage = message.get("usage") if isinstance(message, dict) else None
-    if not isinstance(usage, dict):
-        return None
-    model, ts = message.get("model"), _timestamp_ms(row.get("timestamp"))
-    if not isinstance(model, str) or not model or model == "<synthetic>" or ts is None:
-        return None
+def _tokens(usage: Dict[str, Any]) -> Tokens:
     split = usage.get("cache_creation")
     five, hour = (split.get("ephemeral_5m_input_tokens"), split.get("ephemeral_1h_input_tokens")) if isinstance(split, dict) else (None, None)
     if five is None and hour is None:
         five, hour = usage.get("cache_creation_input_tokens"), 0
     five, hour = _count(five), _count(hour)
-    tokens = Tokens(_count(usage.get("input_tokens")), _count(usage.get("cache_read_input_tokens")),
-                    five + hour, _count(usage.get("output_tokens")), 0, hour)
-    if not tokens.total:
-        return None
-    # A message id is unique to one API response, and some lines carry it without a request id, so
-    # it is the key on its own; the request id is used only when the message id is missing.
+    return Tokens(_count(usage.get("input_tokens")), _count(usage.get("cache_read_input_tokens")),
+                  five + hour, _count(usage.get("output_tokens")), 0, hour)
+
+
+def _records_from_line(line: str) -> List[Tuple[Optional[Tuple[Any, ...]], UsageRecord]]:
+    """The reply's record, and one for each advisor's part of it (`usage.iterations` entries of type
+    `advisor_message`, billed at the advisor's model), as T3 reads them."""
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return []
+    if not isinstance(row, dict) or row.get("type") != "assistant":
+        return []
+    message = row.get("message")
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        return []
+    model, ts = message.get("model"), _timestamp_ms(row.get("timestamp"))
+    if not isinstance(model, str) or not model or model == "<synthetic>" or ts is None:
+        return []
+    # A message id is unique to one API response, the unit Anthropic bills, and some copies carry it without
+    # a request id, so it is the key on its own; the request id is used only when the message id is missing.
     msg_id, request_id = message.get("id"), row.get("requestId")
     key = (("m", msg_id) if isinstance(msg_id, str) and msg_id
            else ("r", request_id) if isinstance(request_id, str) and request_id else None)
     speed = "fast" if usage.get("speed") == "fast" else "standard"
-    return key, UsageRecord("claude", ts, model, None, "", tokens, None, speed, None)
+    found = [(key, UsageRecord("claude", ts, model, None, "", _tokens(usage), None, speed, None))]
+    iterations = usage.get("iterations")
+    for index, part in enumerate(iterations if isinstance(iterations, list) else []):
+        if not isinstance(part, dict) or part.get("type") != "advisor_message":
+            continue
+        advisor = part.get("model")
+        if isinstance(advisor, str) and advisor and advisor != "<synthetic>":
+            found.append((None if key is None else key + ("advisor", index),
+                          UsageRecord("claude", ts, advisor, None, "", _tokens(part), None, speed, None)))
+    return [(k, record) for k, record in found if record.tokens.total]
 
 
 def load_claude_records(roots: Iterable[Path] = (PROJECTS_DIR,), min_file_mtime_ms: float = 0) -> List[UsageRecord]:
-    """One record per assistant reply. A reply is written several times (streaming) and a resumed
-    or forked chat copies its history, so a reply is kept once, as the copy with the most output.
-    Raises CacheError when no root exists or a transcript cannot be read."""
+    """One record per assistant reply (and per advisor's part of it). A reply is written several times (streaming)
+    and a resumed or forked chat copies its history, so a reply is kept once: the first copy's time and model, and
+    each token figure the largest of its copies, as T3 merges them (`load._merge_copies`), so this read and T3's
+    scan cache count a reply the same way. Raises CacheError when no root exists or a transcript cannot be read."""
     roots = list(roots)
     if not any(os.path.isdir(str(root)) for root in roots):
         raise CacheError("no Claude Code transcripts folder found")
@@ -141,14 +154,11 @@ def load_claude_records(roots: Iterable[Path] = (PROJECTS_DIR,), min_file_mtime_
                 for line in handle:
                     if '"usage"' not in line or '"assistant"' not in line:
                         continue
-                    found = _record_from_line(line)
-                    if found is None:
-                        continue
-                    key, record = found
-                    if key is None:
-                        unkeyed.append(record)
-                    elif key not in best or record.tokens.output > best[key].tokens.output:
-                        best[key] = record
+                    for key, record in _records_from_line(line):
+                        if key is None:
+                            unkeyed.append(record)
+                        else:
+                            best[key] = _merge_copies(best[key], record) if key in best else record
         except FileNotFoundError:  # removed since the folder was listed
             continue
         except OSError as error:
