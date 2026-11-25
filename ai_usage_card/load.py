@@ -273,24 +273,11 @@ def cursor_cache_path(userdata_dir: Path) -> Path:
     return userdata_dir / (CURSOR_CACHE_STEM + "%d.json" % CURSOR_CACHE_VERSION)
 
 
-def load_cursor_account(path: Path, live_since_ms: Optional[float] = None) -> Tuple[List[UsageRecord], Optional[int]]:
-    """Cursor's account usage and the time it is complete up to (`untilMs`); no records and None without a file.
-
-    The file holds one entry per API key. T3 turns each into a usage source named after its `accountKey`,
-    keeping one source per account (two keys of one account count once), and its aggregator then drops
-    repeated dedupe keys; so every account counts, the most recently fetched entry of each, and `dedupe`
-    does the rest. T3 builds every dedupe key from the account (`cursor-account:<accountKey>:...`), so two
-    accounts never share one, and the same usage cannot be counted under two of them.
-
-    The time returned is the earliest `untilMs` of the accounts fetched at or after `live_since_ms` (all of
-    them when it is None), so a day is held back from freezing until every account still being read has
-    reached past it. T3 fetches every key it holds on each scan and never deletes an entry, so an account
-    not fetched since `live_since_ms` is a key T3 no longer holds or has failed to read for that long: its
-    records still count, but it cannot hold freezing back, because nothing will ever move its end. None
-    when no account was fetched since then."""
+def _cursor_accounts(path: Path) -> List[Tuple[float, List[UsageRecord], int, int]]:
+    """The most recently fetched entry of each Cursor account as (fetchedAtMs, records, sinceMs, untilMs)."""
     _refuse_newer_version(path.parent, CURSOR_CACHE_STEM, CURSOR_CACHE_VERSION)
     if not path.exists():
-        return [], None
+        return []
     document = _read_json(path)
     version = document.get("version") if isinstance(document, dict) else None
     if isinstance(version, bool) or not isinstance(version, int) or not CURSOR_CACHE_MIN_VERSION <= version <= CURSOR_CACHE_VERSION:
@@ -302,7 +289,7 @@ def load_cursor_account(path: Path, live_since_ms: Optional[float] = None) -> Tu
     def at(index: Any) -> Optional[str]:
         return strings[index] if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(strings) else None
 
-    latest = {}  # type: Dict[str, Tuple[float, List[UsageRecord], int]]
+    latest = {}  # type: Dict[str, Tuple[float, List[UsageRecord], int, int]]
     for account in accounts.values():
         if (not isinstance(account, dict) or not isinstance(account.get("accountKey"), str)
                 or not all(_num(account.get(field)) for field in ("sinceMs", "untilMs", "fetchedAtMs"))
@@ -324,9 +311,38 @@ def load_cursor_account(path: Path, live_since_ms: Optional[float] = None) -> Tu
         else:  # a malformed account is dropped whole, as T3 does
             kept = latest.get(account["accountKey"])
             if kept is None or account["fetchedAtMs"] > kept[0]:
-                latest[account["accountKey"]] = (account["fetchedAtMs"], decoded, int(account["untilMs"]))
-    records = [r for _, decoded, _ in latest.values() for r in decoded]
-    live = [until for fetched, _, until in latest.values() if live_since_ms is None or fetched >= live_since_ms]
+                latest[account["accountKey"]] = (account["fetchedAtMs"], decoded, int(account["sinceMs"]), int(account["untilMs"]))
+    return list(latest.values())
+
+
+def load_cursor_coverage(path: Path) -> Tuple[List[UsageRecord], Optional[int], Optional[int]]:
+    """The records `load_cursor_account` reads, and the span every account covers: the latest `sinceMs` and the
+    earliest `untilMs` (None, None without an account)."""
+    accounts = _cursor_accounts(path)
+    records = [r for _, decoded, _, _ in accounts for r in decoded]
+    if not accounts:
+        return records, None, None
+    return records, max(a[2] for a in accounts), min(a[3] for a in accounts)
+
+
+def load_cursor_account(path: Path, live_since_ms: Optional[float] = None) -> Tuple[List[UsageRecord], Optional[int]]:
+    """Cursor's account usage and the time it is complete up to (`untilMs`); no records and None without a file.
+
+    The file holds one entry per API key. T3 turns each into a usage source named after its `accountKey`,
+    keeping one source per account (two keys of one account count once), and its aggregator then drops
+    repeated dedupe keys; so every account counts, the most recently fetched entry of each, and `dedupe`
+    does the rest. T3 builds every dedupe key from the account (`cursor-account:<accountKey>:...`), so two
+    accounts never share one, and the same usage cannot be counted under two of them.
+
+    The time returned is the earliest `untilMs` of the accounts fetched at or after `live_since_ms` (all of
+    them when it is None), so a day is held back from freezing until every account still being read has
+    reached past it. T3 fetches every key it holds on each scan and never deletes an entry, so an account
+    not fetched since `live_since_ms` is a key T3 no longer holds or has failed to read for that long: its
+    records still count, but it cannot hold freezing back, because nothing will ever move its end. None
+    when no account was fetched since then."""
+    accounts = _cursor_accounts(path)
+    records = [r for _, decoded, _, _ in accounts for r in decoded]
+    live = [until for fetched, _, _, until in accounts if live_since_ms is None or fetched >= live_since_ms]
     return records, min(live) if live else None
 
 

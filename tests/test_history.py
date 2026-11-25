@@ -12,7 +12,7 @@ from unittest import mock
 
 from ai_usage_card import cli, history
 from ai_usage_card.history import Ledger, LedgerError, Row
-from ai_usage_card.load import Tokens, UsageRecord
+from ai_usage_card.load import CacheError, Tokens, UsageRecord
 from ai_usage_card.render import DARK, LIGHT, render, render_phone
 from ai_usage_card.summarise import TIMEZONE, freeze, summarise
 from tests import fixtures as fx
@@ -413,3 +413,102 @@ class CliHistoryTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RepairCursorTests(Base):
+    """`--repair-cursor-history` with literal numbers. Demo data: the cache holds two accounts covering 1 Oct 00:00 to
+    10 Oct 00:00 Dhaka (rates: grok-4.6 input $2 and output $6 per million, so a record of 1000 input and 500 output
+    tokens is 1500 tokens and costs 0.002 + 0.003 = $0.005 unless it reports its own cost)."""
+
+    def userdata(self, since=at(10, 1, 0), until=at(10, 10, 0), records=None):
+        strings = ["cursor-grok-4.6-high-fast", "agent-session"]
+        a = [[at(10, 3, 12), 0, 1, 1000, 0, 0, 500, None, "cursor-account:a:1"]]  # 3 Oct: 1500 tokens, $0.005
+        b = [[at(10, 3, 13), 0, 1, 2000, 0, 0, 1000, None, "cursor-account:b:1"],  # 3 Oct: 3000 tokens, $0.01
+             [at(10, 4, 9), 0, 1, 1000, 0, 0, 500, 0.5, "cursor-account:b:2"]]  # 4 Oct: 1500 tokens, reported $0.5
+        accounts = {n: {"accountKey": n, "sinceMs": since, "untilMs": until, "fetchedAtMs": until, "records": r}
+                    for n, r in (("a", a), ("b", b))} if records is None else records
+        return fx.write_userdata(self.tmp / "userdata", scan={"version": 5, "sources": {}, "models": [], "sessions": [], "files": {}},
+                                 cursor={"version": 2, "strings": strings, "accounts": accounts})
+
+    def saved(self, ledger):
+        path = self.tmp / "history.json"
+        history.save(path, ledger)
+        return path
+
+    def ledger(self):
+        return Ledger({date(2026, 10, 2): [Row("cursor", "cursor-auto", 7, 0.1)],  # not in the cache: left alone
+                       date(2026, 10, 3): [Row("claude", OPUS, 900, 9.0), Row("cursor", "cursor-grok-4.6-high-fast", 1500, 0.005)],
+                       date(2026, 10, 4): [Row("codex", "gpt-6-luna", 50, 0.5)]}, date(2026, 10, 1))
+
+    def run_repair(self, path, userdata, dry_run=False):
+        from ai_usage_card import repair
+        return repair.run(path, userdata, dry_run, datetime(2026, 11, 26, 9, 30, 15, tzinfo=TIMEZONE))
+
+    def test_it_replaces_only_the_cursor_rows_and_keeps_every_other_tool(self):
+        path = self.saved(self.ledger())
+        text, backup = self.run_repair(path, self.userdata())
+        days = history.load(path).days
+        self.assertEqual(days[date(2026, 10, 3)], [Row("claude", OPUS, 900, 9.0), Row("cursor", "cursor-grok-4.6-high-fast", 4500, 0.015)])
+        self.assertEqual(days[date(2026, 10, 4)], [Row("codex", "gpt-6-luna", 50, 0.5), Row("cursor", "cursor-grok-4.6-high-fast", 1500, 0.5)])
+        self.assertEqual(days[date(2026, 10, 2)], [Row("cursor", "cursor-auto", 7, 0.1)])
+        self.assertIn("2026-10-03 to 2026-10-04", text)
+
+    def test_running_it_twice_changes_nothing_the_second_time(self):
+        path = self.saved(self.ledger())
+        self.run_repair(path, self.userdata())
+        first = path.read_text()
+        text, backup = self.run_repair(path, self.userdata())
+        self.assertEqual(path.read_text(), first)
+        self.assertIsNone(backup)
+        self.assertIn("nothing to repair", text)
+        self.assertEqual(len(list(self.tmp.glob("history.json.*.bak"))), 1)
+
+    def test_a_cost_that_differs_only_by_float_noise_is_not_a_gap(self):
+        ledger = self.ledger()
+        ledger.days[date(2026, 10, 3)][1] = Row("cursor", "cursor-grok-4.6-high-fast", 4500, 0.015000003)
+        ledger.days[date(2026, 10, 4)][:] = [Row("codex", "gpt-6-luna", 50, 0.5), Row("cursor", "cursor-grok-4.6-high-fast", 1500, 0.5)]
+        path = self.saved(ledger)
+        text, backup = self.run_repair(path, self.userdata())
+        self.assertIsNone(backup)
+        self.assertIn("nothing to repair", text)
+
+    def test_a_backup_of_the_old_history_is_written_next_to_it_before_the_new_one(self):
+        path = self.saved(self.ledger())
+        before = path.read_text()
+        _, backup = self.run_repair(path, self.userdata())
+        self.assertEqual(backup.name, "history.json.20261126T093015.bak")
+        self.assertEqual(backup.parent, path.parent)
+        self.assertEqual(backup.read_text(), before)
+        self.assertNotEqual(path.read_text(), before)
+
+    def test_a_dry_run_prints_the_table_and_writes_nothing(self):
+        path = self.saved(self.ledger())
+        before = path.read_text()
+        text, backup = self.run_repair(path, self.userdata(), dry_run=True)
+        self.assertEqual(path.read_text(), before)
+        self.assertIsNone(backup)
+        self.assertEqual(list(self.tmp.glob("*.bak")), [])
+        self.assertIn("total", text)
+        self.assertIn("6000", text)  # tokens after, 4500 + 1500
+
+    def test_days_the_cache_does_not_hold_are_left_alone(self):
+        ledger = Ledger({date(2026, 9, 20): [Row("claude", OPUS, 5, 1.0)]}, date(2026, 9, 1))
+        ledger = Ledger({**ledger.days, **self.ledger().days}, date(2026, 9, 1))
+        path = self.saved(ledger)
+        self.run_repair(path, self.userdata())
+        self.assertEqual(history.load(path).days[date(2026, 9, 20)], [Row("claude", OPUS, 5, 1.0)])
+
+    def test_it_refuses_when_the_cache_does_not_cover_a_day_it_would_change(self):
+        path = self.saved(self.ledger())
+        before = path.read_text()
+        with self.assertRaises(CacheError):
+            self.run_repair(path, self.userdata(since=at(10, 3, 6)))  # 3 Oct starts before the cache does
+        with self.assertRaises(CacheError):
+            self.run_repair(path, self.userdata(until=at(10, 4, 12)))  # 4 Oct ends after it
+        self.assertEqual(path.read_text(), before)
+        self.assertEqual(list(self.tmp.glob("*.bak")), [])
+
+    def test_a_cache_without_cursor_usage_refuses(self):
+        path = self.saved(self.ledger())
+        with self.assertRaises(CacheError):
+            self.run_repair(path, self.userdata(records={}))
