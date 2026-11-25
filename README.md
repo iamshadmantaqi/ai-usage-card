@@ -26,6 +26,15 @@ The history is `~/Library/Application Support/ai-usage-card/history.json` (chang
 - **A bad file.** A missing file starts a new history. A file that is not valid JSON, has another version, holds a day, a row or a number that does not fit the layout, or holds a tool or model name that is not a plain name refuses the run (exit 1, reason in the log) and is never overwritten.
 - **Trial runs.** With `--out` and no `--history` the history is read but not written, so a trial run (for example with another `--userdata`) cannot change the real file.
 
+### Repairing Cursor's frozen days (one-off)
+
+A day frozen while Cursor's usage was missing keeps that gap, because frozen days are never recomputed. While T3 Code's
+Cursor cache still holds those days, `python3 -m ai_usage_card --repair-cursor-history --dry-run` prints, per range of days, the
+Cursor tokens and cost the history holds and what the cache gives; without `--dry-run` it copies the history to
+`history.json.<timestamp>.bak` next to it and replaces only the `cursor` rows of those days. Other tools' rows are untouched, days the
+cache does not hold are left alone, and it refuses (writing nothing) when any Cursor account in the cache, a lapsed one included, does not cover a day it
+would change, or when a day would end up with fewer Cursor tokens than the history holds. It reads the same records a freeze does. Running it twice changes nothing.
+
 ## Costs are API-equivalent
 
 The cost is what the same tokens would cost at the public API list prices (from the LiteLLM rate table that T3 Code caches). It is not what I paid. A model with no known rate counts its tokens and adds $0.

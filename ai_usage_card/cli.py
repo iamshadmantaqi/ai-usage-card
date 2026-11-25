@@ -21,6 +21,7 @@ from .pricing import load_rates
 from .privacy import PrivacyError, check_privacy
 from .refresh import refresh_t3_usage
 from .history import Ledger, LedgerError
+from .repair import run as repair_cursor_history
 from .render import DARK, LIGHT, fmt_cost, fmt_tokens, period_label, render, render_phone
 from .summarise import FREEZE_AFTER_DAYS, TIMEZONE, freeze, last_frozen_day, local_day, summarise, window_start_ms
 
@@ -146,6 +147,9 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
                         help="credential helper for the working clone ('' to use the system one)")
     parser.add_argument("--no-t3-refresh", action="store_true",
                         help="read T3 Code's caches as they are, without asking a running T3 Code to rescan first")
+    parser.add_argument("--repair-cursor-history", action="store_true",
+                        help="one-off: rebuild the Cursor rows of the frozen days from T3 Code's Cursor cache, then exit (backs the history up first)")
+    parser.add_argument("--dry-run", action="store_true", help="with --repair-cursor-history: print what would change and write nothing")
     args = parser.parse_args(argv)
 
     args.log.parent.mkdir(parents=True, exist_ok=True)
@@ -154,6 +158,10 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
                         force=True)
     try:
         history_path = args.history or DEFAULT_HISTORY
+        if args.repair_cursor_history:
+            text, _ = repair_cursor_history(history_path, args.userdata, args.dry_run, now)
+            print(text)
+            return 0
         saved = ledger_file.load(history_path)  # a corrupt file refuses the run here, before anything can overwrite it
         if not args.no_t3_refresh:
             # Codex, Grok and the other tools are only as fresh as T3's scan cache; a failure here only logs a warning.
