@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import re
 import subprocess
@@ -143,17 +144,63 @@ class LoadTests(Case):
         del bad_entry["files"]["/f/c.jsonl"]["o"]
         no_models = fx.scan_cache_v17(version=18)
         no_models["models"] = {"0": "x"}
-        for name, scan in (("bad_row", bad_row), ("short_row", short_row), ("bad_entry", bad_entry), ("no_models", no_models)):
+        wide_row = fx.scan_cache_v17(version=18)
+        wide_row["files"]["/f/b.jsonl"]["r"][1].append(7)  # a fifteenth field nobody has checked
+        cases = (("bad_row", bad_row, "version 18 has rows"), ("short_row", short_row, "version 18 has rows"),
+                 ("wide_row", wide_row, "version 18 has rows"), ("bad_entry", bad_entry, "version 18 has a file entry"),
+                 ("no_models", no_models, "unexpected shape"))
+        for name, scan, message in cases:
             folder = fx.write_userdata(self.tmp / name, scan=scan, scan_version=18)
-            with self.assertRaises(CacheError, msg=name):
+            with self.assertRaisesRegex(CacheError, message, msg=name):
                 load_records(folder)
+
+    def test_rows_t3_would_reject_drop_their_file_in_a_checked_version(self):
+        for name, field, value in (("null_one_hour", 13, None), ("number_turn_id", 12, 5)):
+            scan = fx.scan_cache_v17()
+            scan["files"]["/f/b.jsonl"]["r"][1][field] = value
+            folder = fx.write_userdata(self.tmp / name, scan=scan, scan_version=17)
+            keys = {r.dedupe_key: r.tokens.total for r in load_records(folder)}
+            self.assertNotIn("msg_d:req_d", keys, msg=name)  # b.jsonl dropped
+            self.assertEqual(keys["msg_a:req_a"], 10000, msg=name)
+
+    def test_a_wider_row_in_a_checked_version_is_read_as_t3_reads_it(self):
+        scan = fx.scan_cache_v17()
+        scan["files"]["/f/b.jsonl"]["r"][1].append(7)
+        folder = fx.write_userdata(self.tmp / "u17wide", scan=scan, scan_version=17)
+        self.assertEqual({r.dedupe_key: r.tokens.total for r in load_records(folder)}["msg_d:req_d"], 20)
+
+    def test_the_cache_saved_last_is_read_when_an_older_t3_left_two(self):
+        folder = fx.write_userdata(self.tmp / "two", scan=fx.scan_cache_v17(), scan_version=17)
+        older = fx.scan_cache_v9()
+        older["version"] = 16
+        older["files"] = {"/f/c.jsonl": older["files"]["/f/c.jsonl"]}
+        (folder / "usage-scan-cache-v16.json").write_text(json.dumps(older))
+        os.utime(folder / "usage-scan-cache-v17.json", (1_000_000, 1_000_000))  # frozen long ago
+        self.assertEqual([r.provider for r in load_records(folder) if r.provider != "cursor"], ["codex"])  # v16 only
+        os.utime(folder / "usage-scan-cache-v16.json", (500_000, 500_000))  # a leftover from before the upgrade
+        self.assertEqual(len([r for r in load_records(folder) if r.provider == "grok"]), 4)  # v17 again
+
+    def test_grok_keys_from_before_version_17_get_the_time_added(self):
+        def grok_keys(version):
+            scan = fx.scan_cache_v17(version=version)
+            e1 = list(fx.E1)
+            e1[8] = "grok-turn:mystery-model"  # T3 16 wrote Grok keys without the time
+            twin = list(e1)
+            twin[0] += 1000  # a second reply with the same old key
+            scan["files"]["/f/e.jsonl"]["r"] = [e1, twin]
+            folder = fx.write_userdata(self.tmp / ("grok%d" % version), scan=scan, scan_version=version)
+            return sorted(r.dedupe_key for r in load_records(folder) if r.provider == "grok")
+        e1_time = fx.E1[0]
+        self.assertEqual(grok_keys(16), ["grok-turn:%d:mystery-model" % e1_time, "grok-turn:%d:mystery-model" % (e1_time + 1000)])
+        self.assertEqual(grok_keys(17), ["grok-turn:mystery-model"])  # version 17 keys are taken as written, so the twin is a copy
 
     def test_a_checked_version_with_one_bad_file_still_only_drops_that_file(self):
         scan = fx.scan_cache_v17()
-        scan["files"]["/f/c.jsonl"]["r"][0][3] = "lots"
+        scan["files"]["/f/b.jsonl"]["r"][1][3] = "lots"
         folder = fx.write_userdata(self.tmp / "u17bad", scan=scan, scan_version=17)
-        self.assertEqual([r for r in load_records(folder) if r.provider == "codex"][0].tokens.total, 350)  # d.jsonl still has it
-        self.assertEqual(len([r for r in load_records(folder) if r.provider == "codex"]), 1)
+        keys = {r.dedupe_key: r.tokens.total for r in load_records(folder)}
+        self.assertNotIn("msg_d:req_d", keys)  # only b.jsonl has it
+        self.assertEqual(keys["msg_a:req_a"], 10000)  # a.jsonl still has it
 
     def test_a_file_whose_version_field_is_not_the_one_in_its_name_is_refused(self):
         scan = fx.scan_cache_v9()
