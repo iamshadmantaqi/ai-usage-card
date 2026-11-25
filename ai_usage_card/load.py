@@ -19,8 +19,9 @@ T3 writes it only when set, with the thirteenth before it, null when there is no
 the 1-hour rate and `min(cacheCreation1h, cacheCreation)` of `cacheCreation` at the 5-minute rate), `mt` (the
 malformed lines' times) and, at the top level, `coveredSince` (per source, how far back T3 has scanned).
 Version 17 adds the record's time to Grok dedupe keys read from older files, as `_decode_scan_rows` does.
-The other changes, up to 17, are to how T3 resumes reading Codex, Grok and Claude files. `coveredSince`,
-`mr`, `mt` and the resume state are not read here.
+The other changes, up to 17, are to how T3 resumes reading Codex, Grok and Claude files. `coveredSince` is
+read only for the Claude folders (`claude_coverage`, which decides whether the card counts Claude Code from
+this cache); `mr`, `mt` and the resume state are not read here.
 
 A version above the last one checked (`SCAN_CACHE_CHECKED_THROUGH`) is read anyway when its structure
 matches this layout, with a warning; it is refused when a file entry or row does not match, or a row is
@@ -78,7 +79,7 @@ class Tokens:
     reasoning: int
     # Part of `cache_creation` that was written with the 1-hour lifetime (priced higher than the
     # 5-minute default), never added to a total. T3 records it only for Claude Code, in cache versions
-    # after 9; the card reads Claude Code from its transcripts, so a T3 record's figure is not used.
+    # after 9; the transcript read (`claude.py`) fills it the same way.
     cache_creation_1h: int = 0
 
     @property
@@ -257,6 +258,22 @@ def _claude_folders(document: Dict[str, Any]) -> List[str]:
     return folders
 
 
+def claude_coverage(document: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    """Each Claude Code folder T3 scans (its real folder, `dir`), and how far back T3 has read it: `coveredSince`
+    under "claude\\0<dir>", T3's own key, or None when T3 has not recorded it."""
+    sources, covered = document.get("sources"), document.get("coveredSince")
+    covered = covered if isinstance(covered, dict) else {}
+    coverage = {}  # type: Dict[str, Optional[int]]
+    for key, value in (sources.items() if isinstance(sources, dict) else ()):
+        provider, _, folder = key.partition("\0") if isinstance(key, str) else ("", "", "")
+        real = value.get("dir") if isinstance(value, dict) and isinstance(value.get("dir"), str) else folder
+        if provider != "claude" or not real:
+            continue
+        since = covered.get("claude\0" + real)
+        coverage[real] = int(since) if _num(since) else None
+    return coverage
+
+
 def cursor_rate_model(model: str) -> str:
     """T3's `cursorRateModel`: Cursor's tiered names to the base model's rate-table key."""
     base = re.sub(r"^cursor-", "", model, count=1)
@@ -369,16 +386,38 @@ def _shared_session_key(record: UsageRecord, occurrence: int) -> str:
     return "%s:%d" % (identity, occurrence)
 
 
-def dedupe(per_file: List[List[UsageRecord]]) -> List[UsageRecord]:
-    """Global de-duplication by dedupe key, first copy wins, exactly as T3's aggregator does.
+def _merge_copies(held: UsageRecord, copy: UsageRecord) -> UsageRecord:
+    """T3's `mergeUsageCopies`: each token figure's largest copy and the larger reported cost, with the first
+    copy's time, model, session and speed."""
+    a, b = held.tokens, copy.tokens
+    costs = [c for c in (held.reported_cost_usd, copy.reported_cost_usd) if c is not None]
+    return UsageRecord(held.provider, held.timestamp_ms, held.model, held.rate_model, held.session_id,
+                       Tokens(max(a.uncached, b.uncached), max(a.cached, b.cached), max(a.cache_creation, b.cache_creation),
+                              max(a.output, b.output), max(a.reasoning, b.reasoning), max(a.cache_creation_1h, b.cache_creation_1h)),
+                       max(costs) if costs else None, held.speed, held.dedupe_key)
 
-    Claude Code copies a message's records forward when a session is resumed or forked, so the
-    same `message.id:requestId` key legitimately appears in several transcripts. (The card reads
-    Claude Code from its transcripts instead, see `claude.py`; T3's Claude records are only checked
-    for presence.)
+
+def claude_reply_key(key: str) -> str:
+    """The key a Claude Code reply is counted once under, from T3's `<message id>:<request id>` (with
+    `:advisor:<n>` after it for an advisor's part of the reply). A message id names one API response, which is what
+    Anthropic bills, and a copy of a reply can be written without its request id (one Haiku reply on 16 November
+    2026, which T3 counts twice), so the message id is the key on its own and the request id only stands in when
+    there is no message id, as `claude.py` keys the transcripts."""
+    message, _, rest = key.partition(":")
+    request, _, part = rest.partition(":")
+    return "claude:" + ("m:" + message if message else "r:" + request) + (":" + part if part else "")
+
+
+def dedupe(per_file: List[List[UsageRecord]]) -> List[UsageRecord]:
+    """Global de-duplication by dedupe key, as T3's aggregator does: the first copy is kept, and for Claude
+    Code each token figure is the largest of its copies, counted once per message id (`claude_reply_key`).
+
+    Claude Code writes a reply several times while it streams (only the last copy has the final output) and
+    copies a message's records forward when a session is resumed or forked, so the same message id
+    legitimately appears several times, within a transcript and across them.
     """
     shared = _shared_sessions(per_file)
-    seen = set()  # type: Set[str]
+    seen = {}  # type: Dict[str, int]
     kept = []  # type: List[UsageRecord]
     for records in per_file:
         occurrences = {}  # type: Dict[Tuple[Any, ...], int]
@@ -389,24 +428,30 @@ def dedupe(per_file: List[List[UsageRecord]]) -> List[UsageRecord]:
                 identity = (record.provider, record.session_id, record.timestamp_ms, record.model, t)
                 occurrences[identity] = occurrences.get(identity, 0) + 1
                 key = _shared_session_key(record, occurrences[identity])
+            elif record.provider == "claude" and key is not None:
+                key = claude_reply_key(key)
             if key is not None:
                 if key in seen:
+                    if record.provider == "claude":
+                        kept[seen[key]] = _merge_copies(kept[seen[key]], record)
                     continue
-                seen.add(key)
+                seen[key] = len(kept)
             kept.append(record)
     return kept
 
 
 def load_t3(userdata_dir: Path, min_file_mtime_ms: float = 0,
-            cursor_live_since_ms: Optional[float] = None) -> Tuple[List[UsageRecord], List[str], Optional[int]]:
+            cursor_live_since_ms: Optional[float] = None
+            ) -> Tuple[List[UsageRecord], List[str], Optional[int], Dict[str, Optional[int]]]:
     """Every usage record T3 Code knows about, de-duplicated, the Claude Code transcript folders
-    it scans (used only to read those folders, never stored), and the time Cursor's account cache is
+    it scans (used only to read those folders, never stored), the time Cursor's account cache is
     complete up to (None when Cursor has no cache or no account fetched since `cursor_live_since_ms`, see
-    `load_cursor_account`). Raises CacheError if the scan cache is unusable."""
+    `load_cursor_account`), and how far back T3 has read each Claude folder (`claude_coverage`). Raises
+    CacheError if the scan cache is unusable."""
     document = _read_scan_document(*scan_cache_path(userdata_dir))
     per_file = _scan_records(document, min_file_mtime_ms)
     cursor, cursor_until = load_cursor_account(cursor_cache_path(userdata_dir), cursor_live_since_ms)
-    return dedupe(per_file + [cursor]), _claude_folders(document), cursor_until
+    return dedupe(per_file + [cursor]), _claude_folders(document), cursor_until, claude_coverage(document)
 
 
 def load_records(userdata_dir: Path, min_file_mtime_ms: float = 0) -> List[UsageRecord]:

@@ -158,6 +158,16 @@ def _frozen(ledger: Ledger, today: date) -> Dict[date, List[Row]]:
     return {day: rows for day, rows in ledger.days.items() if timedelta(days=FREEZE_AFTER_DAYS) <= today - day}
 
 
+def first_live_day(ledger: Ledger, today: date) -> date:
+    """The oldest day this run may take from live records rather than the history: the first day from the history's
+    start (the window's first day before there is one) that is not frozen."""
+    saved = _frozen(ledger, today)
+    day = max(ledger.start, window_first(today)) if ledger.start is not None else window_first(today)
+    while day in saved:
+        day += timedelta(days=1)
+    return day
+
+
 def _anchor(records: Iterable[UsageRecord]) -> List[UsageRecord]:
     """The records that decide where the history starts: the file-based tools, which the 60-day cleanup cuts. With
     only long-history tools in the data, those are used."""
