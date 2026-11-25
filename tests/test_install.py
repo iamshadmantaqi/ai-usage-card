@@ -84,6 +84,14 @@ class FindPythonTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), os.path.join(prefix, APP))
         self.assertEqual(result.stderr, "")
 
+    def test_warns_when_the_python_it_picks_is_too_old(self):
+        prefix = os.path.join(self.versions, "3.8")
+        make_script(os.path.join(prefix, APP), "exit 1\n")
+        _, result = self.find(prefix)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), os.path.join(prefix, APP))
+        self.assertIn("older than Python 3.9", result.stderr)
+
     def test_falls_back_to_the_shim_with_a_warning(self):
         base, result = self.find(os.path.join(self.tmp.name, "missing"))
         self.assertEqual(result.returncode, 0)

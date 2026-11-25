@@ -8,7 +8,7 @@
 # The path goes through the framework's Versions/Current link, not Versions/3.9, so a Command Line Tools
 # update that moves Python to a new version folder does not leave the plist pointing at a missing binary.
 # If Current is missing it prints the versioned path, and if Python.app is missing it falls back to the
-# shim with a warning on stderr.
+# shim with a warning on stderr. It also warns when the Python it picks is older than 3.9.
 #
 # AI_USAGE_CARD_BASE_PYTHON replaces /usr/bin/python3 as the interpreter asked where Python.app is (the
 # tests use it).
@@ -21,6 +21,10 @@ PREFIX="$("$BASE" -c 'import sys; print(sys.base_prefix)' 2>/dev/null || true)"
 if [ -n "$PREFIX" ]; then
   for candidate in "$(dirname "$PREFIX")/Current/$APP" "$PREFIX/$APP"; do
     if [ -x "$candidate" ]; then
+      # The card is tested on Python 3.9 and later, the oldest the Command Line Tools still ship.
+      if ! "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
+        echo "Warning: $candidate is older than Python 3.9 or does not start; the card needs 3.9 or later." >&2
+      fi
       echo "$candidate"
       exit 0
     fi
