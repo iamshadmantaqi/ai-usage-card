@@ -90,6 +90,12 @@ class LoadTests(Case):
         records = load_records(self.tmp / "userdata1")
         self.assertEqual([r.tokens.total for r in records if r.provider == "cursor"], [3500])
 
+    def test_the_version_2_cursor_cache_wins_over_a_version_1_file_left_behind(self):
+        old = fx.cursor_cache()
+        old["accounts"]["keychain"]["records"] = [[fx.ms(10, 17, 3), 0, 1, 7, 0, 0, 0, None, "cursor-account:k:old"]]
+        (self.userdata / "usage-cursor-account-cache-v1.json").write_text(json.dumps(dict(old, version=1)))
+        self.assertEqual([r.tokens.total for r in load_records(self.userdata) if r.provider == "cursor"], [3500])
+
     def test_reads_a_version_9_cache_the_way_it_reads_version_5(self):
         v5 = sorted((r.provider, r.model, r.tokens.total) for r in load_records(self.userdata))
         v9 = fx.write_userdata(self.tmp / "userdata9", scan=fx.scan_cache_v9(), scan_version=9)
@@ -371,10 +377,25 @@ class ClaudeTranscriptTests(Case):
 
     def test_a_stale_cursor_cache_holds_back_the_freeze_even_with_a_fresh_scan_cache(self):
         cursor = fx.cursor_cache()
-        cursor["accounts"]["keychain"]["untilMs"] = fx.ms(9, 1, 0)  # Cursor's login lapsed on 1 Sep
+        # T3 last read Cursor on 25 Sep, 23 days before today: its usage since then may still arrive
+        cursor["accounts"]["keychain"].update(untilMs=fx.ms(9, 25, 0), fetchedAtMs=fx.ms(9, 25, 0))
         fx.write_userdata(self.userdata, cursor=cursor)
-        self.assertEqual(cli.gather(self.userdata, self.projects, fx.NOW)[1], fx.ms(9, 1, 0))
+        self.assertEqual(cli.gather(self.userdata, self.projects, fx.NOW)[1], fx.ms(9, 25, 0))
         (self.userdata / "usage-cursor-account-cache-v2.json").unlink()  # no Cursor login: the scan cache alone decides
+        self.assertEqual(cli.gather(self.userdata, self.projects, fx.NOW)[1], fx.ms(10, 18, 2))
+
+    def test_a_cursor_account_not_read_for_30_days_no_longer_holds_back_the_freeze(self):
+        cursor = fx.cursor_cache()
+        # a key T3 stopped reading on 1 Sep (47 days before today) stays in the file; its records still count
+        cursor["accounts"]["gone"] = dict(cursor["accounts"]["keychain"], accountKey="gone", untilMs=fx.ms(9, 1, 0),
+                                          fetchedAtMs=fx.ms(9, 1, 0),
+                                          records=[[fx.ms(8, 31, 3), 0, 1, 70, 0, 0, 0, None, "cursor-account:gone:1:0"]])
+        fx.write_userdata(self.userdata, cursor=cursor)
+        records, through = cli.gather(self.userdata, self.projects, fx.NOW)
+        self.assertEqual(sorted(r.tokens.total for r in records if r.provider == "cursor"), [70, 3500])
+        self.assertEqual(through, fx.ms(10, 18, 2))  # the live account and the scan cache decide
+        del cursor["accounts"]["keychain"]  # the only account is the stale one: the scan cache alone decides
+        fx.write_userdata(self.userdata, cursor=cursor)
         self.assertEqual(cli.gather(self.userdata, self.projects, fx.NOW)[1], fx.ms(10, 18, 2))
 
     def test_the_forced_freeze_warning_names_the_newest_day_it_freezes(self):

@@ -36,7 +36,9 @@ Cursor cache `usage-cursor-account-cache-v<N>.json`, N 1 or 2 (checked against T
 
 Version 2 changed only the key of `accounts`, from the credential's file to a digest of each API key; the
 rows are the same. T3 no longer has a setting that switches Cursor usage off (`cursorKeychainUsageEnabled`
-is gone from its code): it reads every Cursor API key it holds, so every account in the file counts.
+is gone from its code): it reads every Cursor API key it holds. T3 leaves an entry in the file after it stops
+holding that key and then no longer shows its usage; the card still counts it, so every account in the file
+counts.
 
 Reasoning tokens are a subset of output tokens, so they are never added to a total.
 """
@@ -262,11 +264,6 @@ def cursor_rate_model(model: str) -> str:
     return "xai/" + base if base.startswith("grok-") else base
 
 
-def load_cursor_cache(path: Path) -> List[UsageRecord]:
-    """Cursor's account usage. A missing file means no Cursor login, so no records."""
-    return load_cursor_account(path)[0]
-
-
 def cursor_cache_path(userdata_dir: Path) -> Path:
     """The newest Cursor cache file there is: version 2, else the version 1 file an older T3 left behind."""
     for version in range(CURSOR_CACHE_VERSION, CURSOR_CACHE_MIN_VERSION - 1, -1):
@@ -276,14 +273,21 @@ def cursor_cache_path(userdata_dir: Path) -> Path:
     return userdata_dir / (CURSOR_CACHE_STEM + "%d.json" % CURSOR_CACHE_VERSION)
 
 
-def load_cursor_account(path: Path) -> Tuple[List[UsageRecord], Optional[int]]:
+def load_cursor_account(path: Path, live_since_ms: Optional[float] = None) -> Tuple[List[UsageRecord], Optional[int]]:
     """Cursor's account usage and the time it is complete up to (`untilMs`); no records and None without a file.
 
     The file holds one entry per API key. T3 turns each into a usage source named after its `accountKey`,
     keeping one source per account (two keys of one account count once), and its aggregator then drops
     repeated dedupe keys; so every account counts, the most recently fetched entry of each, and `dedupe`
-    does the rest. The time returned is the earliest `untilMs` of those accounts, the one that holds a
-    day back from freezing until every account has reached past it."""
+    does the rest. T3 builds every dedupe key from the account (`cursor-account:<accountKey>:...`), so two
+    accounts never share one, and the same usage cannot be counted under two of them.
+
+    The time returned is the earliest `untilMs` of the accounts fetched at or after `live_since_ms` (all of
+    them when it is None), so a day is held back from freezing until every account still being read has
+    reached past it. T3 fetches every key it holds on each scan and never deletes an entry, so an account
+    not fetched since `live_since_ms` is a key T3 no longer holds or has failed to read for that long: its
+    records still count, but it cannot hold freezing back, because nothing will ever move its end. None
+    when no account was fetched since then."""
     _refuse_newer_version(path.parent, CURSOR_CACHE_STEM, CURSOR_CACHE_VERSION)
     if not path.exists():
         return [], None
@@ -321,10 +325,9 @@ def load_cursor_account(path: Path) -> Tuple[List[UsageRecord], Optional[int]]:
             kept = latest.get(account["accountKey"])
             if kept is None or account["fetchedAtMs"] > kept[0]:
                 latest[account["accountKey"]] = (account["fetchedAtMs"], decoded, int(account["untilMs"]))
-    if not latest:
-        return [], None
     records = [r for _, decoded, _ in latest.values() for r in decoded]
-    return records, min(until for _, _, until in latest.values())
+    live = [until for fetched, _, until in latest.values() if live_since_ms is None or fetched >= live_since_ms]
+    return records, min(live) if live else None
 
 
 def _shared_sessions(per_file: List[List[UsageRecord]]) -> Set[str]:
@@ -378,13 +381,15 @@ def dedupe(per_file: List[List[UsageRecord]]) -> List[UsageRecord]:
     return kept
 
 
-def load_t3(userdata_dir: Path, min_file_mtime_ms: float = 0) -> Tuple[List[UsageRecord], List[str], Optional[int]]:
+def load_t3(userdata_dir: Path, min_file_mtime_ms: float = 0,
+            cursor_live_since_ms: Optional[float] = None) -> Tuple[List[UsageRecord], List[str], Optional[int]]:
     """Every usage record T3 Code knows about, de-duplicated, the Claude Code transcript folders
     it scans (used only to read those folders, never stored), and the time Cursor's account cache is
-    complete up to (None when Cursor has no cache). Raises CacheError if the scan cache is unusable."""
+    complete up to (None when Cursor has no cache or no account fetched since `cursor_live_since_ms`, see
+    `load_cursor_account`). Raises CacheError if the scan cache is unusable."""
     document = _read_scan_document(*scan_cache_path(userdata_dir))
     per_file = _scan_records(document, min_file_mtime_ms)
-    cursor, cursor_until = load_cursor_account(cursor_cache_path(userdata_dir))
+    cursor, cursor_until = load_cursor_account(cursor_cache_path(userdata_dir), cursor_live_since_ms)
     return dedupe(per_file + [cursor]), _claude_folders(document), cursor_until
 
 
