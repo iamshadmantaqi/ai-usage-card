@@ -12,7 +12,8 @@ The call, as T3 Code 0.1.12 serves it (checked against its bundled server in Nov
    `userdata/server-runtime.json`, with the token in the `Authorization` header.
 3. One Effect RPC request in JSON: `{"_tag": "Request", "id": "1", "tag": "server.getUsageSummary",
    "payload": {sinceDay, untilDay, timeZone, awaitRefresh: true}, "headers": []}`; T3 answers with an
-   `Exit` message once the scan is done and then saves its cache.
+   `Exit` message once the scan is done. It starts saving its cache as it answers, so the card then waits (up
+   to `SAVE_WAIT_S`) for the cache file to change before it reads it.
 4. `t3 auth session revoke <id>`, so the session is gone at once rather than in five minutes.
 
 The token lives only in this process: it is never written to disk or to the log. Every failure (T3 Code not
@@ -44,6 +45,9 @@ SESSION_TTL = "5m"
 SESSION_LABEL = "ai-usage-card refresh"
 CLI_TIMEOUT_S = 60.0
 SCAN_TIMEOUT_S = 180.0
+SAVE_WAIT_S = 15.0  # T3 saves its cache just after it answers; a scan that found nothing new saves nothing
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024  # T3's answer for 31 days is about 75 KB
+SCAN_CACHE_GLOB = "usage-scan-cache-v*.json"
 SCAN_DAYS = 31  # the card's live days (FREEZE_AFTER_DAYS) and one more; older days come from the saved history
 _WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -70,6 +74,7 @@ def refresh_t3_usage(userdata: Path, today: date, timezone: str, cli: Optional[P
         if not os.access(str(command), os.X_OK):
             raise RefreshError("T3 Code's command is not installed")
         env = dict(os.environ, T3CODE_HOME=str(userdata.parent))
+        saved_before = _cache_stamp(userdata)
         session_id, token = _issue_session(command, run, env)
         try:
             payload = {"sinceDay": (today - timedelta(days=SCAN_DAYS - 1)).isoformat(), "untilDay": today.isoformat(),
@@ -77,8 +82,10 @@ def refresh_t3_usage(userdata: Path, today: date, timezone: str, cli: Optional[P
             summary = _call(port, token, payload, timeout_s)
         finally:
             _revoke_session(command, run, env, session_id)
-        log.info("T3 Code rescanned its usage in %.1fs (%d sources)", time.monotonic() - started,
-                 len(summary.get("sources") or []))
+        saved = _wait_for_save(userdata, saved_before, SAVE_WAIT_S)
+        log.info("T3 Code rescanned its usage in %.1fs (%d sources); %s", time.monotonic() - started,
+                 len(summary.get("sources") or []),
+                 "its cache was saved" if saved else "its cache did not change within %.0fs" % SAVE_WAIT_S)
         return True
     except RefreshError as error:
         reason = str(error)
@@ -86,6 +93,30 @@ def refresh_t3_usage(userdata: Path, today: date, timezone: str, cli: Optional[P
         reason = "%s" % type(error).__name__
     log.warning("T3 Code was not asked to rescan its usage (%s); reading its cache as it is", reason)
     return False
+
+
+def _cache_stamp(userdata: Path):
+    """The name, modification time and size of every scan cache file, to see when T3 has saved a new one."""
+    stamp = set()
+    for path in userdata.glob(SCAN_CACHE_GLOB):
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        stamp.add((path.name, info.st_mtime_ns, info.st_size))
+    return frozenset(stamp)
+
+
+def _wait_for_save(userdata: Path, before, wait_s: float) -> bool:
+    """True once a scan cache file differs from `before`. T3 writes it to a temporary file and renames it into
+    place, so a changed file is a whole one."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        if _cache_stamp(userdata) != before:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def _server_port(userdata: Path) -> int:
@@ -140,20 +171,29 @@ def _call(port: int, token: str, payload: Dict[str, Any], timeout_s: float) -> D
         _handshake(sock, port, token, deadline)
         request = {"_tag": "Request", "id": "1", "tag": METHOD, "payload": payload, "headers": []}
         _send_frame(sock, 0x1, json.dumps(request).encode("utf-8"))
-        while True:
-            try:
-                messages = json.loads(_read_message(sock, deadline).decode("utf-8"))
-            except ValueError:
-                raise RefreshError("T3 Code answered with something other than JSON")
-            for message in messages if isinstance(messages, list) else [messages]:
-                if isinstance(message, dict) and message.get("_tag") in ("Defect", "ClientProtocolError"):
-                    raise RefreshError("T3 Code reported a protocol error")
-                if not isinstance(message, dict) or message.get("_tag") != "Exit" or message.get("requestId") != "1":
-                    continue  # pings, acknowledgements and anything else T3 adds later
-                exit_ = message.get("exit") or {}
-                if exit_.get("_tag") == "Success" and isinstance(exit_.get("value"), dict):
-                    return exit_["value"]
-                raise RefreshError("T3 Code refused the usage request")
+        summary = _await_exit(sock, deadline)
+        try:
+            _send_frame(sock, 0x8, struct.pack("!H", 1000))  # a normal close; T3 copes without one
+        except OSError:
+            pass
+        return summary
+
+
+def _await_exit(sock: socket.socket, deadline: float) -> Dict[str, Any]:
+    while True:
+        try:
+            messages = json.loads(_read_message(sock, deadline).decode("utf-8"))
+        except ValueError:
+            raise RefreshError("T3 Code answered with something other than JSON")
+        for message in messages if isinstance(messages, list) else [messages]:
+            if isinstance(message, dict) and message.get("_tag") in ("Defect", "ClientProtocolError"):
+                raise RefreshError("T3 Code reported a protocol error")
+            if not isinstance(message, dict) or message.get("_tag") != "Exit" or message.get("requestId") != "1":
+                continue  # pings, acknowledgements and anything else T3 adds later
+            exit_ = message.get("exit")
+            if isinstance(exit_, dict) and exit_.get("_tag") == "Success" and isinstance(exit_.get("value"), dict):
+                return exit_["value"]
+            raise RefreshError("T3 Code refused the usage request")
 
 
 def _handshake(sock: socket.socket, port: int, token: str, deadline: float) -> None:
@@ -188,7 +228,7 @@ def _recv(sock: socket.socket, size: int, deadline: float) -> bytes:
             raise RefreshError("T3 Code did not answer in time")
         sock.settimeout(left)
         try:
-            chunk = sock.recv(size - len(data))
+            chunk = sock.recv(min(size - len(data), 1 << 20))
         except socket.timeout:
             raise RefreshError("T3 Code did not answer in time")
         if not chunk:
@@ -211,7 +251,8 @@ def _send_frame(sock: socket.socket, opcode: int, payload: bytes) -> None:
 
 
 def _read_message(sock: socket.socket, deadline: float) -> bytes:
-    """The next whole data message, answering pings on the way."""
+    """The next whole data message, answering pings on the way. A message over `MAX_MESSAGE_BYTES` is refused
+    before it is read."""
     data = bytearray()
     while True:
         first, second = _recv(sock, 2, deadline)
@@ -220,6 +261,8 @@ def _read_message(sock: socket.socket, deadline: float) -> bytes:
             size = struct.unpack("!H", _recv(sock, 2, deadline))[0]
         elif size == 127:
             size = struct.unpack("!Q", _recv(sock, 8, deadline))[0]
+        if len(data) + size > MAX_MESSAGE_BYTES:
+            raise RefreshError("T3 Code sent an oversized reply")
         mask = _recv(sock, 4, deadline) if second & 0x80 else b""
         payload = _recv(sock, size, deadline) if size else b""
         if mask:

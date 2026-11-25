@@ -155,10 +155,11 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
     try:
         history_path = args.history or DEFAULT_HISTORY
         saved = ledger_file.load(history_path)  # a corrupt file refuses the run here, before anything can overwrite it
-        now = now or datetime.now(TIMEZONE)
         if not args.no_t3_refresh:
             # Codex, Grok and the other tools are only as fresh as T3's scan cache; a failure here only logs a warning.
-            refresh_t3_usage(args.userdata, now.astimezone(TIMEZONE).date(), getattr(TIMEZONE, "key", "Asia/Dhaka"))
+            today = (now or datetime.now(TIMEZONE)).astimezone(TIMEZONE).date()
+            refresh_t3_usage(args.userdata, today, getattr(TIMEZONE, "key", "Asia/Dhaka"))
+        now = now or datetime.now(TIMEZONE)  # taken after the refresh, which can take a few minutes
         try:
             cards, frozen = build(args.userdata, now, args.claude_projects, saved)
         except Refused as error:

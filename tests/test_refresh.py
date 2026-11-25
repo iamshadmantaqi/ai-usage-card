@@ -13,6 +13,7 @@ import time
 import unittest
 from datetime import date
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 from ai_usage_card import cli, refresh
@@ -27,9 +28,11 @@ GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 class FakeT3(threading.Thread):
     """A one-connection stand-in for T3's /ws endpoint. `mode` picks its answer."""
 
-    def __init__(self, mode: str = "success"):
+    def __init__(self, mode: str = "success", cache: Optional[Path] = None):
         super().__init__(daemon=True)
         self.mode = mode
+        self.cache = cache  # written once the client has closed, as T3 saves its cache just after it answers
+        self.after_reply = []  # (opcode, payload) of each frame the client sent after the reply
         self.server = socket.socket()
         self.server.bind(("127.0.0.1", 0))
         self.server.listen(1)
@@ -63,12 +66,21 @@ class FakeT3(threading.Thread):
                 accept = base64.b64encode(b"not the right answer").decode()
             conn.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                           "Sec-WebSocket-Accept: %s\r\n\r\n" % accept).encode())
-            self.request = json.loads(self._read_frame(conn))
+            try:
+                self.request = json.loads(self._read_frame(conn))
+            except (OSError, EOFError):  # the client gave up after the handshake, as it should on a wrong answer
+                return
             if self.mode == "silent":
+                self.stop.wait(5)
+                return
+            if self.mode == "oversized":  # a header that claims a terabyte and never sends it
+                conn.sendall(struct.pack("!BBQ", 0x81, 127, 1 << 40))
                 self.stop.wait(5)
                 return
             if self.mode == "failure":
                 reply = {"_tag": "Exit", "requestId": "1", "exit": {"_tag": "Failure", "cause": []}}
+            elif self.mode == "odd-exit":
+                reply = {"_tag": "Exit", "requestId": "1", "exit": "Success"}
             else:
                 summary = {"contractVersion": 6, "sources": [{"fingerprint": {"provider": "codex"}, "status": "ok"}] * 3,
                            "buckets": [{"n": i} for i in range(3000)]}  # large enough for a 64-bit length
@@ -78,7 +90,13 @@ class FakeT3(threading.Thread):
             body = json.dumps(reply).encode()
             middle = len(body) // 2  # and the reply in two fragments
             conn.sendall(self._frame(0x1, body[:middle], fin=False) + self._frame(0x0, body[middle:]))
-            self.stop.wait(1)
+            try:
+                while not self.after_reply or self.after_reply[-1][0] != 0x8:
+                    self.after_reply.append(self._read_frame(conn, with_opcode=True))
+            except (OSError, EOFError):
+                return
+            if self.cache is not None:
+                self.cache.write_text("{}")
 
     @staticmethod
     def _frame(opcode, payload, fin=True):
@@ -91,11 +109,14 @@ class FakeT3(threading.Thread):
         return struct.pack("!BBQ", first, 127, size) + payload
 
     @staticmethod
-    def _read_frame(conn):
+    def _read_frame(conn, with_opcode=False):
         def exact(n):
             data = b""
             while len(data) < n:
-                data += conn.recv(n - len(data))
+                chunk = conn.recv(n - len(data))
+                if not chunk:
+                    raise EOFError
+                data += chunk
             return data
         first, second = exact(2)
         size = second & 0x7F
@@ -104,7 +125,8 @@ class FakeT3(threading.Thread):
         elif size == 127:
             size = struct.unpack("!Q", exact(8))[0]
         mask = exact(4)
-        return bytes(b ^ mask[i % 4] for i, b in enumerate(exact(size)))
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(exact(size)))
+        return (first & 0x0F, payload) if with_opcode else payload
 
     def close(self):
         self.stop.set()
@@ -143,8 +165,8 @@ class RefreshTests(unittest.TestCase):
         self.cli_path.write_text("#!/bin/sh\nexit 99\n")  # never run: every test passes a fake runner
         self.cli_path.chmod(0o755)
 
-    def start(self, mode="success"):
-        server = FakeT3(mode)
+    def start(self, mode="success", saves=True):
+        server = FakeT3(mode, self.userdata / "usage-scan-cache-v17.json" if saves else None)
         server.start()
         self.addCleanup(server.close)
         (self.userdata / "server-runtime.json").write_text(json.dumps({"version": 1, "port": server.port}))
@@ -162,6 +184,9 @@ class RefreshTests(unittest.TestCase):
         result, text = self.refresh(run)
         self.assertTrue(result)
         self.assertIn("T3 Code rescanned its usage", text)
+        self.assertIn("(3 sources); its cache was saved", text)
+        self.assertTrue((self.userdata / "usage-scan-cache-v17.json").exists())
+        self.assertEqual(server.after_reply, [(0xA, b"ping"), (0x8, struct.pack("!H", 1000))])  # the pong, then a close
         self.assertEqual(run.verbs, ["issue", "revoke"])
         issue_args, issue_kwargs = run.calls[0]
         self.assertEqual(issue_kwargs["env"]["T3CODE_HOME"], str(self.home))
@@ -170,6 +195,16 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(server.request["tag"], "server.getUsageSummary")
         self.assertEqual(server.request["payload"], {"sinceDay": "2026-09-18", "untilDay": "2026-10-18",
                                                      "timeZone": "Asia/Dhaka", "awaitRefresh": True})
+
+    def test_a_rescan_that_saves_nothing_new_waits_only_so_long(self):
+        (self.userdata / "usage-scan-cache-v17.json").write_text("{}")
+        self.start(saves=False)
+        started = time.monotonic()
+        with mock.patch.object(refresh, "SAVE_WAIT_S", 0.5):
+            result, text = self.refresh(FakeCli())
+        self.assertTrue(result)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIn("(3 sources); its cache did not change within 0s", text)
 
     def test_t3_not_running_falls_back_without_calling_its_command(self):
         run = FakeCli()
@@ -239,6 +274,24 @@ class RefreshTests(unittest.TestCase):
         result, text = self.refresh(run)
         self.assertFalse(result)
         self.assertIn("T3 Code refused the usage request", text)
+        self.assertEqual(run.verbs, ["issue", "revoke"])
+
+    def test_an_odd_exit_counts_as_a_refusal(self):
+        self.start("odd-exit")
+        run = FakeCli()
+        result, text = self.refresh(run)
+        self.assertFalse(result)
+        self.assertIn("T3 Code refused the usage request", text)
+        self.assertEqual(run.verbs, ["issue", "revoke"])
+
+    def test_an_oversized_reply_is_refused_before_it_is_read(self):
+        self.start("oversized")
+        run = FakeCli()
+        started = time.monotonic()
+        result, text = self.refresh(run)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertFalse(result)
+        self.assertIn("T3 Code sent an oversized reply", text)
         self.assertEqual(run.verbs, ["issue", "revoke"])
 
     def test_a_t3_that_never_answers_times_out_and_revokes(self):
