@@ -20,7 +20,7 @@ from .pricing import load_rates
 from .privacy import PrivacyError, check_privacy
 from .history import Ledger, LedgerError
 from .render import DARK, LIGHT, fmt_cost, fmt_tokens, period_label, render, render_phone
-from .summarise import TIMEZONE, freeze, last_frozen_day, local_day, summarise, window_start_ms
+from .summarise import FREEZE_AFTER_DAYS, TIMEZONE, freeze, last_frozen_day, local_day, summarise, window_start_ms
 
 HOME = Path.home()
 DEFAULT_USERDATA = HOME / ".t3" / "userdata"
@@ -57,7 +57,9 @@ def gather(userdata: Path, projects: Path, now: datetime) -> Tuple[List[UsageRec
     floor_ms = window_start_ms(now.astimezone(TIMEZONE).date()) - FILE_SLACK_MS
     # A timestamp in the future (clock skew, a bad row) would defeat the age check in build_cards.
     in_range = lambda r: floor_ms <= r.timestamp_ms <= now_ms
-    t3_records, t3_claude_folders, cursor_until = load_t3(userdata, floor_ms)
+    # A Cursor account T3 has not fetched for as long as a day waits to freeze no longer holds freezing back.
+    cursor_live_since_ms = now_ms - FREEZE_AFTER_DAYS * 86400 * 1000
+    t3_records, t3_claude_folders, cursor_until = load_t3(userdata, floor_ms, cursor_live_since_ms)
     t3 = [r for r in t3_records if in_range(r)]
     scan_newest = max((r.timestamp_ms for r in t3 if r.provider != "cursor"), default=None)
     t3_newest = scan_newest if cursor_until is None or scan_newest is None else min(scan_newest, cursor_until)
