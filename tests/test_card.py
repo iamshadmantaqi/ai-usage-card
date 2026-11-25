@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -415,6 +415,124 @@ class ClaudeTranscriptTests(Case):
         # 0.0169 + 0.00055 + 0.0022 (claude) + 0.0123 (cursor, reported) + 0.000055 (codex) + 0 (grok, unpriced)
         self.assertAlmostEqual(s.total_cost_usd, 0.032005, places=6)
         self.assertEqual(t3_newest, fx.ms(10, 18, 2))  # the Codex row: the scan cache ends before Cursor's untilMs (03:00)
+
+
+class ClaudeFromT3Tests(Case):
+    """Claude Code from T3's scan cache, and the fallback to the transcripts. The T3 rows below are the fixture
+    transcripts' replies as T3 17 stores them (every streamed copy, key `message.id:requestId`), so both paths
+    must give the same numbers: X 5100 tokens $0.0169, Y 170 $0.00055, F 300 $0.0022, and the 1 Aug reply 2 tokens."""
+
+    LIVE_SINCE = date(2026, 9, 18)  # 30 days before 18 Oct: the oldest day a full history leaves live
+
+    @staticmethod
+    def utc(month, day, hour):
+        return int(datetime(2026, month, day, hour, 0, 0, 123000, tzinfo=timezone.utc).timestamp() * 1000)
+
+    def t3_scan(self, sources=None, covered=None):
+        models = ["claude-opus-5-5", "claude-sonnet-5-5", "gpt-6-luna"]
+
+        def row(ts, model, uncached, cached, creation, output, key, one_hour=0, speed=fx.STANDARD, cost=None):
+            return [ts, models.index(model), 0, uncached, cached, creation, output, 0, key, cost, speed, None, None, one_hour]
+        x = lambda output: row(self.utc(10, 17, 6), "claude-opus-5-5", 100, 1000, 1000, output, "msg_x:req_x", one_hour=600)
+        folder = str(self.projects)
+        return {
+            "version": 17, "models": models, "sessions": ["s"],
+            "sources": sources if sources is not None else {"claude\0/demo/.claude-alt/projects": {"dir": folder}},
+            "coveredSince": covered if covered is not None else {"claude\0" + folder: fx.ms(8, 1, 0)},
+            "files": {
+                "/f/chat1.jsonl": fx.entry("claude", [x(10), x(200),  # two streamed copies, the last one not final
+                                                      row(self.utc(10, 17, 7), "claude-opus-5-5", 100, 0, 0, 200, "msg_f:req_f", speed=fx.FAST, cost=9.0)]),
+                "/f/chat2.jsonl": fx.entry("claude", [x(3000)]),  # the resumed chat's final copy
+                "/f/agent-1.jsonl": fx.entry("claude", [row(self.utc(10, 16, 5), "claude-sonnet-5-5", 50, 0, 100, 20, "msg_y:req_y")]),
+                "/f/old.jsonl": fx.entry("claude", [row(self.utc(8, 1, 5), "claude-opus-5-5", 1, 0, 0, 1, "msg_o:req_o")]),
+                "/f/codex.jsonl": fx.entry("codex", [row(fx.ms(10, 18, 2), "gpt-6-luna", 100, 200, 0, 50, None)]),
+            },
+        }
+
+    def use(self, scan):
+        for old in self.userdata.glob("usage-scan-cache-v*.json"):
+            old.unlink()
+        fx.write_userdata(self.userdata, scan=scan, scan_version=17)
+
+    def gather(self, live_since):
+        with self.assertLogs("ai-usage-card", "INFO") as logs:
+            records, _ = cli.gather(self.userdata, self.projects, fx.NOW, live_since)
+        return sorted(r.tokens.total for r in records if r.provider == "claude"), "\n".join(logs.output), records
+
+    def test_t3_rows_give_the_same_tokens_and_cost_as_the_transcripts(self):
+        self.use(self.t3_scan())
+        with mock.patch.object(cli, "load_claude_records", side_effect=AssertionError("transcripts read")):
+            totals, log, records = self.gather(self.LIVE_SINCE)
+        self.assertIn("Claude Code read from T3 Code's scan cache", log)
+        self.assertEqual(totals, [2, 170, 300, 5100])
+        x = next(r for r in records if r.tokens.total == 5100)
+        self.assertEqual((x.tokens.output, x.tokens.cache_creation_1h, x.timestamp_ms), (3000, 600, self.utc(10, 17, 6)))
+        self.assertEqual({r.reported_cost_usd for r in records if r.provider == "claude"}, {None})  # F's reported $9 is dropped
+        from_t3 = summarise(records, load_rates(self.userdata), TODAY)
+        transcripts, _, _ = self.gather(None)
+        self.assertEqual(transcripts, [2, 170, 300, 5100])
+        from_transcripts = summarise(cli.gather(self.userdata, self.projects, fx.NOW)[0], load_rates(self.userdata), TODAY)
+        for s in (from_t3, from_transcripts):
+            self.assertEqual([(t.label, t.tokens) for t in s.tools], [("Claude Code", 5570), ("Cursor", 3500), ("Codex", 350)])
+            # Claude Code 0.0169 + 0.00055 + 0.0022, Cursor 0.0123 (reported), Codex 0.000055
+            self.assertAlmostEqual(s.total_cost_usd, 0.032005, places=9)
+
+    def test_a_scan_that_starts_on_the_first_live_day_is_enough(self):
+        start = int(datetime(2026, 9, 18, tzinfo=cli.TIMEZONE).timestamp() * 1000)
+        self.use(self.t3_scan(covered={"claude\0" + str(self.projects): start}))
+        self.assertIn("scan cache", self.gather(self.LIVE_SINCE)[1])
+
+    def test_falls_back_to_the_transcripts_with_the_reason(self):
+        folder, elsewhere = str(self.projects), str(self.tmp / "elsewhere")
+        cases = [
+            (None, self.t3_scan(), "T3 Code did not rescan"),
+            (self.LIVE_SINCE, self.t3_scan(covered={"claude\0" + folder: fx.ms(9, 20, 0)}),
+             "T3 Code's scan of a Claude Code folder starts 2026-09-20, and the card needs it from 2026-09-18"),
+            (self.LIVE_SINCE, self.t3_scan(covered={}), "T3 Code's scan of a Claude Code folder has no start, and the card needs it from 2026-09-18"),
+            (self.LIVE_SINCE, self.t3_scan(sources={"claude\0" + elsewhere: {"dir": elsewhere}},
+                                           covered={"claude\0" + elsewhere: fx.ms(8, 1, 0)}),
+             "T3 Code does not scan the Claude Code folder given to the card"),
+            (self.LIVE_SINCE, self.t3_scan(sources={}), "T3 Code scans no Claude Code folder"),
+        ]
+        for live_since, scan, reason in cases:
+            with self.subTest(reason):
+                self.use(scan)
+                totals, log, _ = self.gather(live_since)
+                self.assertIn("Claude Code read from its transcripts: " + reason, log)
+                self.assertEqual(totals, [2, 170, 300, 5100])
+
+    def test_a_second_claude_folder_must_reach_back_too(self):
+        folder, other = str(self.projects), str(self.tmp / "other")
+        self.use(self.t3_scan(sources={"claude\0" + folder: {"dir": folder}, "claude\0" + other: {"dir": other}},
+                              covered={"claude\0" + folder: fx.ms(8, 1, 0), "claude\0" + other: fx.ms(10, 1, 0)}))
+        self.assertIn("a Claude Code folder starts 2026-10-01", self.gather(self.LIVE_SINCE)[1])
+
+    def test_streamed_copies_keep_each_figures_largest_and_the_first_time(self):
+        scan = self.t3_scan()
+        first = scan["files"]["/f/chat1.jsonl"]["r"][0]
+        scan["files"]["/f/chat2.jsonl"]["r"] = [[first[0] + 1000] + first[1:4] + [900, 1000, 3000] + first[7:]]
+        self.use(scan)
+        x = next(r for r in load_records(self.userdata) if r.dedupe_key == "msg_x:req_x")
+        self.assertEqual((x.tokens.uncached, x.tokens.cached, x.tokens.cache_creation, x.tokens.output, x.timestamp_ms),
+                         (100, 1000, 1000, 3000, self.utc(10, 17, 6)))
+
+    def test_build_asks_for_the_first_live_day_only_after_a_rescan(self):
+        self.use(self.t3_scan())
+        with mock.patch.object(cli, "gather", wraps=cli.gather) as gathered:
+            cli.build(self.userdata, fx.NOW, self.projects, None, True)
+            cli.build(self.userdata, fx.NOW, self.projects)
+        # no history yet: every day of the window is live, back to 20 Apr, which T3's scan (from 1 Aug) does not reach
+        self.assertEqual([c[0][3] for c in gathered.call_args_list], [date(2026, 4, 20), None])
+
+    def test_the_first_live_day_follows_the_history(self):
+        from ai_usage_card.history import Ledger, Row
+        from ai_usage_card.summarise import first_live_day
+        rows = [Row("claude", "claude-opus-5-5", 1, 0.0)]
+        days = {date(2026, 8, 30) + timedelta(days=n): rows for n in range(20)}  # 30 Aug to 18 Sep
+        self.assertEqual(first_live_day(Ledger(days, date(2026, 8, 30)), TODAY), date(2026, 9, 19))
+        del days[date(2026, 9, 4)]  # a day with no usage is never saved, so it stays live
+        self.assertEqual(first_live_day(Ledger(days, date(2026, 8, 30)), TODAY), date(2026, 9, 4))
+        self.assertEqual(first_live_day(Ledger.empty(), TODAY), date(2026, 4, 20))  # the window's first day
 
 
 class PricingTests(Case):

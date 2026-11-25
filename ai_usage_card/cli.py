@@ -1,5 +1,5 @@
-"""Entry point: ask T3 Code to rescan its usage, read Claude Code's transcripts and T3 Code's caches and the saved daily
-history, build the card, write it or publish it.
+"""Entry point: ask T3 Code to rescan its usage, read T3 Code's caches (and Claude Code's transcripts when T3's scan
+cannot be trusted for Claude Code) and the saved daily history, build the card, write it or publish it.
 
 Exit 0 when the card is current (published or unchanged); exit 1 when it refuses, with the
 reason in the log. A refusal never commits or pushes anything.
@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
 from . import history as ledger_file
@@ -23,7 +25,8 @@ from .refresh import refresh_t3_usage
 from .history import Ledger, LedgerError
 from .repair import run as repair_cursor_history
 from .render import DARK, LIGHT, fmt_cost, fmt_tokens, period_label, render, render_phone
-from .summarise import FREEZE_AFTER_DAYS, TIMEZONE, freeze, last_frozen_day, local_day, summarise, window_start_ms
+from .summarise import (FREEZE_AFTER_DAYS, TIMEZONE, first_live_day, freeze, last_frozen_day, local_day, summarise,
+                        window_start_ms)
 
 HOME = Path.home()
 DEFAULT_USERDATA = HOME / ".t3" / "userdata"
@@ -47,51 +50,80 @@ class Refused(Exception):
         self.history = history
 
 
-def gather(userdata: Path, projects: Path, now: datetime) -> Tuple[List[UsageRecord], Optional[int]]:
+def _t3_claude_gap(projects: Path, coverage: Dict[str, Optional[int]], live_since: date) -> Optional[str]:
+    """Why T3 Code's Claude Code records cannot stand in for the transcripts, or None when they can: T3 scans
+    `projects` and has read every Claude folder it scans back to the start of `live_since` (BD time)."""
+    if not coverage:
+        return "T3 Code scans no Claude Code folder"
+    if os.path.realpath(str(projects)) not in {os.path.realpath(folder) for folder in coverage}:
+        return "T3 Code does not scan the Claude Code folder given to the card"
+    since_ms = int(datetime(live_since.year, live_since.month, live_since.day, tzinfo=TIMEZONE).timestamp() * 1000)
+    for since in coverage.values():
+        if since is None or since > since_ms:
+            return "T3 Code's scan of a Claude Code folder %s, and the card needs it from %s" % (
+                "has no start" if since is None else "starts %s" % local_day(since).isoformat(), live_since.isoformat())
+    return None
+
+
+def gather(userdata: Path, projects: Path, now: datetime,
+           claude_live_since: Optional[date] = None) -> Tuple[List[UsageRecord], Optional[int]]:
     """Records for the window, and the time both of T3 Code's caches are complete up to (None if they cover
     nothing): the older of the scan cache's newest record and Cursor's `untilMs`, so one fresh cache cannot hide
     the other being stale.
 
-    Claude Code comes from its own transcripts (see `claude.py`), read from `projects` and from every
-    Claude folder T3 scans; T3's Claude records are dropped so nothing is counted twice. Everything
-    else stays on T3's caches. Refuses when T3 has Claude usage in the window and the transcripts give
-    none, which means Claude Code's data has moved out of reach."""
+    Claude Code comes from T3's scan cache when `claude_live_since` is given (T3 has just rescanned) and T3 has
+    read every Claude folder it scans, `projects` among them, back to that day, the first day the card takes
+    from live records; T3 17 counts Claude Code as the transcripts do (`claude.py`). Otherwise it comes from
+    the transcripts, read from `projects` and from every Claude folder T3 scans, with T3's Claude records
+    dropped so nothing is counted twice, and one log line says why. Everything else stays on T3's caches. On
+    the transcript read, refuses when T3 has Claude usage in the window and the transcripts give none, which
+    means Claude Code's data has moved out of reach."""
     now_ms = int(now.timestamp() * 1000)
     floor_ms = window_start_ms(now.astimezone(TIMEZONE).date()) - FILE_SLACK_MS
     # A timestamp in the future (clock skew, a bad row) would defeat the age check in build_cards.
     in_range = lambda r: floor_ms <= r.timestamp_ms <= now_ms
     # A Cursor account T3 has not fetched for as long as a day waits to freeze no longer holds freezing back.
     cursor_live_since_ms = now_ms - FREEZE_AFTER_DAYS * 86400 * 1000
-    t3_records, t3_claude_folders, cursor_until = load_t3(userdata, floor_ms, cursor_live_since_ms)
+    t3_records, t3_claude_folders, cursor_until, coverage = load_t3(userdata, floor_ms, cursor_live_since_ms)
     t3 = [r for r in t3_records if in_range(r)]
     scan_newest = max((r.timestamp_ms for r in t3 if r.provider != "cursor"), default=None)
     t3_newest = scan_newest if cursor_until is None or scan_newest is None else min(scan_newest, cursor_until)
+    gap = "T3 Code did not rescan" if claude_live_since is None else _t3_claude_gap(projects, coverage, claude_live_since)
+    if gap is None:
+        log.info("Claude Code read from T3 Code's scan cache")
+        # A reported cost is dropped, so Claude Code is priced exactly as the transcript read prices it.
+        return [r if r.provider != "claude" else replace(r, reported_cost_usd=None) for r in t3], t3_newest
+    log.info("Claude Code read from its transcripts: %s", gap)
     claude = [r for r in load_claude_records([projects] + [Path(f) for f in t3_claude_folders], floor_ms) if in_range(r)]
     if not claude and any(r.provider == "claude" for r in t3):
         raise Refused("T3 Code has Claude Code usage in the window but its transcripts gave none")
     return [r for r in t3 if r.provider != "claude"] + claude, t3_newest
 
 
-def build_cards(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: Optional[Ledger] = None) -> Dict[str, str]:
+def build_cards(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: Optional[Ledger] = None,
+                t3_rescanned: bool = False) -> Dict[str, str]:
     """The four SVGs, without the history that was frozen on the way (see `build`)."""
-    return build(userdata, now, projects, ledger)[0]
+    return build(userdata, now, projects, ledger, t3_rescanned)[0]
 
 
-def build(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: Optional[Ledger] = None) -> Tuple[Dict[str, str], Ledger]:
+def build(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: Optional[Ledger] = None,
+          t3_rescanned: bool = False) -> Tuple[Dict[str, str], Ledger]:
     """The four SVGs (wide and phone, light and dark) and the history with any newly frozen days, or
     Refused / CacheError / PrivacyError. Pure of side effects except reading: the caller saves the history.
 
-    The window is six months and ends today; days 30 or more days old come from `ledger` once frozen. Claude Code is read from its transcripts, so it is always current; T3
-    Code saves its usage cache only when its usage page is open or `main` has asked it to rescan, so a stale T3
-    cache costs the other tools their recent days, which is logged as a warning."""
+    The window is six months and ends today; days 30 or more days old come from `ledger` once frozen. T3 Code
+    saves its usage cache only when its usage page is open or `main` has asked it to rescan (`t3_rescanned`, which
+    lets Claude Code come from that cache, see `gather`; without it Claude Code is read from its transcripts, so
+    it is always current), so a stale T3 cache costs the other tools their recent days, which is logged as a
+    warning."""
     now_ms = int(now.timestamp() * 1000)
     max_age_ms = MAX_RECORD_AGE.total_seconds() * 1000
-    records, t3_newest = gather(userdata, projects, now)
+    ledger = ledger or Ledger.empty()
+    rates, today = load_rates(userdata), now.astimezone(TIMEZONE).date()
+    records, t3_newest = gather(userdata, projects, now, first_live_day(ledger, today) if t3_rescanned else None)
     if not records:
         raise Refused("no usage records found")
     newest_ms = max(r.timestamp_ms for r in records)
-    ledger = ledger or Ledger.empty()
-    rates, today = load_rates(userdata), now.astimezone(TIMEZONE).date()
     if now_ms - newest_ms > max_age_ms:
         # No card, but days old enough for Claude Code's cleanup are still frozen, so time away does not lose them.
         raise Refused("newest record is %.0f hours old (limit %d): no source has recent usage"
@@ -137,7 +169,7 @@ def keep_history(path: Path, saved: Ledger, frozen: Ledger, trial: bool) -> None
 def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> int:
     parser = argparse.ArgumentParser(prog="ai_usage_card", description=__doc__)
     parser.add_argument("--userdata", type=Path, default=DEFAULT_USERDATA, help="T3 Code's userdata folder")
-    parser.add_argument("--claude-projects", type=Path, default=PROJECTS_DIR, help="Claude Code's transcripts folder (the Claude folders T3 Code scans are read as well)")
+    parser.add_argument("--claude-projects", type=Path, default=PROJECTS_DIR, help="Claude Code's transcripts folder, read when T3 Code's scan of it cannot be used (the Claude folders T3 Code scans are read as well)")
     parser.add_argument("--out", type=Path, help="write the SVGs here and do not publish (the history is then only read, unless --history is given)")
     parser.add_argument("--history", type=Path, help="the saved daily history (default: %s)" % DEFAULT_HISTORY)
     parser.add_argument("--repo", default=DEFAULT_REPO, help="profile repo to publish to")
@@ -146,7 +178,7 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
     parser.add_argument("--git-credential-helper", default=GH_CREDENTIAL_HELPER,
                         help="credential helper for the working clone ('' to use the system one)")
     parser.add_argument("--no-t3-refresh", action="store_true",
-                        help="read T3 Code's caches as they are, without asking a running T3 Code to rescan first")
+                        help="read T3 Code's caches as they are, without asking a running T3 Code to rescan first (Claude Code is then read from its transcripts)")
     parser.add_argument("--repair-cursor-history", action="store_true",
                         help="one-off: rebuild the Cursor rows of the frozen days from T3 Code's Cursor cache, then exit (backs the history up first)")
     parser.add_argument("--dry-run", action="store_true", help="with --repair-cursor-history: print what would change and write nothing")
@@ -163,13 +195,15 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
             print(text)
             return 0
         saved = ledger_file.load(history_path)  # a corrupt file refuses the run here, before anything can overwrite it
+        rescanned = False
         if not args.no_t3_refresh:
-            # Codex, Grok and the other tools are only as fresh as T3's scan cache; a failure here only logs a warning.
+            # Codex, Grok and the other tools are only as fresh as T3's scan cache; a failure here only logs a warning,
+            # and Claude Code is then read from its transcripts.
             today = (now or datetime.now(TIMEZONE)).astimezone(TIMEZONE).date()
-            refresh_t3_usage(args.userdata, today, getattr(TIMEZONE, "key", "Asia/Dhaka"))
+            rescanned = refresh_t3_usage(args.userdata, today, getattr(TIMEZONE, "key", "Asia/Dhaka"))
         now = now or datetime.now(TIMEZONE)  # taken after the refresh, which can take a few minutes
         try:
-            cards, frozen = build(args.userdata, now, args.claude_projects, saved)
+            cards, frozen = build(args.userdata, now, args.claude_projects, saved, rescanned)
         except Refused as error:
             if error.history is None:
                 raise

@@ -1,8 +1,9 @@
 """Claude Code usage, read straight from its transcripts (`~/.claude/projects/**/*.jsonl`).
 
-T3 Code's scan cache is not used for Claude Code because, up to cache version 9, it undercounted it in
-two ways (version 17 keeps the largest of a reply's copies and stores the 1-hour cache writes; the card
-still reads the transcripts, which it has been checked against):
+The card reads Claude Code from T3 Code's scan cache when T3 has just rescanned and has read far enough back
+(`cli.gather`); this module is the fallback. T3's cache up to version 9 undercounted Claude Code in two ways,
+both fixed by version 17 (it keeps each token figure's largest copy and stores the 1-hour cache writes), and
+the two were checked against each other in November 2026:
 
 * Claude Code writes an assistant reply to the transcript several times while it streams, and only
   the last copy carries the final `usage.output_tokens`. T3 kept the first copy.

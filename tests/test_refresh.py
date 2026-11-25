@@ -358,5 +358,22 @@ class CliRefreshTests(unittest.TestCase):
             self.assertEqual(self.run_cli("--no-t3-refresh"), 0)
             self.assertEqual(order, ["build"])
 
+    def test_only_a_rescan_lets_claude_code_come_from_t3(self):
+        seen = []
+        real_build = cli.build
+
+        def build(*args, **kwargs):
+            seen.append(args[4])
+            return real_build(*args, **kwargs)
+
+        with mock.patch.object(cli, "build", side_effect=build):
+            for answered in (True, False):
+                with mock.patch.object(cli, "refresh_t3_usage", return_value=answered):
+                    self.assertEqual(self.run_cli(), 0)
+            self.assertEqual(self.run_cli("--no-t3-refresh"), 0)  # T3 Code is not running here, so it is not asked
+        self.assertEqual(seen, [True, False, False])
+        # the fixture's version 5 cache records no scanned Claude folder, so even after a rescan the transcripts are read
+        self.assertIn("Claude Code read from its transcripts: T3 Code scans no Claude Code folder", (self.tmp / "card.log").read_text())
+
 if __name__ == "__main__":
     unittest.main()
