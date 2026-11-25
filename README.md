@@ -5,7 +5,7 @@ A self-updating SVG card of my AI usage over the last six months, shown on my [G
 ## How it works
 
 1. Claude Code is read straight from its transcripts (`~/.claude/projects/**/*.jsonl` and any other Claude folder T3 Code scans, subagent files included, each real folder and file once). A reply is written to a transcript several times while it streams and only the last copy has the final output count, so the copy with the most output is kept, once per message id (the request id when a line has no message id). Cache writes are priced at the 1-hour rate where the transcript says they were 1-hour writes. Only the model, the time and the token counts are taken from a line. T3 Code's own Claude records are ignored, because its cache keeps the first copy of each reply (about $1,500 short over 30 days) and prices every cache write at the 5-minute rate (about $870 short), together about 12% of Claude Code's cost.
-2. Everything else (Cursor, Codex, Grok and any other tool) comes from T3 Code's local usage cache (the newest `~/.t3/userdata/usage-scan-cache-v<N>.json`, plus its Cursor account cache, `usage-cursor-account-cache-v<N>.json`, and rate table), which already scans those tools, so there is no parser for them here. T3 Code saves that cache when its usage page is open, so those tools are as fresh as the last visit to that page. The log gets a warning when its newest record is over 48 hours old. The window always ends today.
+2. Everything else (Cursor, Codex, Grok and any other tool) comes from T3 Code's local usage cache (the newest `~/.t3/userdata/usage-scan-cache-v<N>.json`, plus its Cursor account cache, `usage-cursor-account-cache-v<N>.json`, and rate table), which already scans those tools, so there is no parser for them here. T3 Code rescans those tools and saves that cache only when asked for a usage summary, which its usage page does, so before reading the cache each run asks a running T3 Code for one (see "Asking T3 Code to rescan" below). When T3 Code is not running or does not answer, the cache is read as it is, as fresh as the last rescan, and the log says why. The log also gets a warning when its newest record is over 48 hours old. The window always ends today.
    Records are de-duplicated and priced the way T3 Code does, from its cached LiteLLM rate table. The T3 record layouts are documented in `ai_usage_card/load.py`.
 3. Claude Code deletes its transcripts after 60 days (`cleanupPeriodDays`) and T3 Code's cache follows them, so a six-month window cannot be read from them. The first run, and every run after, saves each day that is at least 30 days old to a local history file, once, and from then on reads that day from the file. Days under 30 days old always come from the live data. A day is counted from exactly one source, never both. See "History" below.
 4. It draws `ai-usage-light.svg`, `ai-usage-dark.svg`, `ai-usage-phone-light.svg` and `ai-usage-phone-dark.svg` and commits all four in one commit to the `usage-card` branch of the profile repo, only when the bytes of any changed.
@@ -41,7 +41,7 @@ The cost is what the same tokens would cost at the public API list prices (from 
 
 ## Install
 
-Needs macOS, Claude Code's transcripts, T3 Code's usage page opened now and then (for the other tools), the system Python 3 (`/usr/bin/python3`, standard library only) and `gh` signed in (`gh auth status`).
+Needs macOS, Claude Code's transcripts, T3 Code running (or its usage page opened now and then) for the other tools, the system Python 3 (`/usr/bin/python3`, standard library only) and `gh` signed in (`gh auth status`).
 
 ```sh
 git clone https://github.com/iamshadmantaqi/ai-usage-card.git
@@ -54,6 +54,16 @@ cd ai-usage-card
 The job runs the Command Line Tools `Python.app` (found from `/usr/bin/python3`), not the `/usr/bin/python3` shim, because macOS cannot grant Full Disk Access to the shim and the job needs it to read Claude Code's transcripts. Grant it once: System Settings > Privacy & Security > Full Disk Access > `+`, press Cmd+Shift+G, paste the path that `install.sh` prints (normally `/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python`) and add it. If `Python.app` is missing, `install.sh` warns and falls back to `/usr/bin/python3`.
 
 To try it without publishing: `python3 -m ai_usage_card --out /tmp/card` writes the four SVGs there. Add `--history /tmp/card/history.json` to see the history it would save.
+
+## Asking T3 Code to rescan
+
+Before it reads T3 Code's cache, each run asks the T3 Code on this Mac to rescan the last 31 days, the way its usage page does:
+
+1. `~/.t3/bin/t3 auth session issue --scope diagnostics:read --ttl 5m --json`, T3 Code's own command for headless clients, gives a session that can only read diagnostics and expires in five minutes.
+2. The card calls T3 Code's `server.getUsageSummary` over its local WebSocket (`/ws`, the port from `~/.t3/userdata/server-runtime.json`) with that session. T3 Code answers when the scan is done (about 1 to 3 seconds on a warm cache) and saves its cache as it answers, so the card waits up to 15 seconds for the cache file to change before reading it; a scan that found nothing new saves nothing, and the card then reads the cache as it is.
+3. `t3 auth session revoke` removes the session at once.
+
+The session token stays in memory for those few seconds: it is never written to a file or the log. If T3 Code is not running, its command is missing, it refuses, it answers in a form the card does not know (a T3 update can change this private interface), it sends a reply over 16 MB, or it takes over 3 minutes, the run logs one warning and reads the cache as it is. `--no-t3-refresh` skips the step. The call was checked against T3 Code 0.1.12 (November 2026); `ai_usage_card/refresh.py` has the details.
 
 ## It refuses to publish when
 

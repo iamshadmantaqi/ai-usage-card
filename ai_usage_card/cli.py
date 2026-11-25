@@ -1,4 +1,5 @@
-"""Entry point: read Claude Code's transcripts and T3 Code's caches and the saved daily history, build the card, write it or publish it.
+"""Entry point: ask T3 Code to rescan its usage, read Claude Code's transcripts and T3 Code's caches and the saved daily
+history, build the card, write it or publish it.
 
 Exit 0 when the card is current (published or unchanged); exit 1 when it refuses, with the
 reason in the log. A refusal never commits or pushes anything.
@@ -18,6 +19,7 @@ from .claude import PROJECTS_DIR, load_claude_records
 from .load import CacheError, UsageRecord, load_t3
 from .pricing import load_rates
 from .privacy import PrivacyError, check_privacy
+from .refresh import refresh_t3_usage
 from .history import Ledger, LedgerError
 from .repair import run as repair_cursor_history
 from .render import DARK, LIGHT, fmt_cost, fmt_tokens, period_label, render, render_phone
@@ -80,8 +82,8 @@ def build(userdata: Path, now: datetime, projects: Path = PROJECTS_DIR, ledger: 
     Refused / CacheError / PrivacyError. Pure of side effects except reading: the caller saves the history.
 
     The window is six months and ends today; days 30 or more days old come from `ledger` once frozen. Claude Code is read from its transcripts, so it is always current; T3
-    Code saves its usage cache only when its usage page is open, so a stale T3 cache costs the
-    other tools their recent days, which is logged as a warning."""
+    Code saves its usage cache only when its usage page is open or `main` has asked it to rescan, so a stale T3
+    cache costs the other tools their recent days, which is logged as a warning."""
     now_ms = int(now.timestamp() * 1000)
     max_age_ms = MAX_RECORD_AGE.total_seconds() * 1000
     records, t3_newest = gather(userdata, projects, now)
@@ -143,6 +145,8 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
     parser.add_argument("--git-credential-helper", default=GH_CREDENTIAL_HELPER,
                         help="credential helper for the working clone ('' to use the system one)")
+    parser.add_argument("--no-t3-refresh", action="store_true",
+                        help="read T3 Code's caches as they are, without asking a running T3 Code to rescan first")
     parser.add_argument("--repair-cursor-history", action="store_true",
                         help="one-off: rebuild the Cursor rows of the frozen days from T3 Code's Cursor cache, then exit (backs the history up first)")
     parser.add_argument("--dry-run", action="store_true", help="with --repair-cursor-history: print what would change and write nothing")
@@ -159,8 +163,13 @@ def main(argv: Optional[List[str]] = None, now: Optional[datetime] = None) -> in
             print(text)
             return 0
         saved = ledger_file.load(history_path)  # a corrupt file refuses the run here, before anything can overwrite it
+        if not args.no_t3_refresh:
+            # Codex, Grok and the other tools are only as fresh as T3's scan cache; a failure here only logs a warning.
+            today = (now or datetime.now(TIMEZONE)).astimezone(TIMEZONE).date()
+            refresh_t3_usage(args.userdata, today, getattr(TIMEZONE, "key", "Asia/Dhaka"))
+        now = now or datetime.now(TIMEZONE)  # taken after the refresh, which can take a few minutes
         try:
-            cards, frozen = build(args.userdata, now or datetime.now(TIMEZONE), args.claude_projects, saved)
+            cards, frozen = build(args.userdata, now, args.claude_projects, saved)
         except Refused as error:
             if error.history is None:
                 raise
