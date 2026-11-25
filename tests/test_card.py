@@ -13,7 +13,7 @@ from unittest import mock
 
 from ai_usage_card import cli, history, publish
 from ai_usage_card.claude import _timestamp_ms, load_claude_records, transcript_files
-from ai_usage_card.load import CacheError, load_records
+from ai_usage_card.load import CacheError, load_records, load_t3
 from ai_usage_card.pricing import load_rates, parse_rate_table, price
 from ai_usage_card.privacy import PrivacyError, check_privacy
 from ai_usage_card.render import DARK, LIGHT, fmt_cost, fmt_tokens, render, render_phone
@@ -60,20 +60,34 @@ class LoadTests(Case):
         with self.assertRaises(CacheError):
             load_records(self.userdata)
 
-    def test_cursor_usage_is_left_out_when_t3_has_it_switched_off(self):
-        fx.write_userdata(self.userdata, cursor_enabled=False)
-        self.assertEqual([r for r in load_records(self.userdata) if r.provider == "cursor"], [])
-        (self.userdata / "settings.json").unlink()  # T3's default is off
-        self.assertEqual([r for r in load_records(self.userdata) if r.provider == "cursor"], [])
+    def test_cursor_usage_counts_without_any_settings_file(self):
+        self.assertFalse((self.userdata / "settings.json").exists())
+        self.assertEqual([r.tokens.total for r in load_records(self.userdata) if r.provider == "cursor"], [3500])
 
-    def test_only_the_most_recently_fetched_cursor_account_counts(self):
-        cursor = fx.cursor_cache()
-        old = dict(cursor["accounts"]["keychain"], accountKey="old", fetchedAtMs=0,
-                   records=[[fx.ms(10, 17, 3), 0, 1, 7, 0, 0, 0, None, "cursor-account:old:1:0"]])
-        cursor["accounts"]["/old/auth.json"] = old
+    def test_every_cursor_key_counts_and_a_repeated_dedupe_key_counts_once(self):
+        def entry(account, fetched, rows):
+            return {"accountKey": account, "sinceMs": 0, "untilMs": fx.MTIME, "fetchedAtMs": fetched, "records": rows}
+        t = fx.ms(10, 18, 3)
+        cursor = {"version": 2, "strings": ["cursor-grok-4.6-high-fast", "s"], "accounts": {
+            "api-key:aaa": entry("one", 5, [[t, 0, 1, 1000, 0, 0, 0, None, "cursor-account:one:1"],
+                                           [t, 0, 1, 20, 0, 0, 0, None, "cursor-account:shared:1"]]),
+            "api-key:bbb": entry("two", 6, [[t, 0, 1, 300, 0, 0, 0, None, "cursor-account:two:1"],
+                                           [t, 0, 1, 20, 0, 0, 0, None, "cursor-account:shared:1"]]),
+            "api-key:ccc": entry("two", 2, [[t, 0, 1, 9999, 0, 0, 0, None, "cursor-account:stale:1"]])}}
         fx.write_userdata(self.userdata, cursor=cursor)
-        self.assertEqual([r.dedupe_key for r in load_records(self.userdata) if r.provider == "cursor"],
-                         ["cursor-account:k:1:0"])
+        # one: 1000 + 20; two: 300 (its second copy of "shared" is dropped); the older entry of "two" is ignored
+        self.assertEqual(sorted(r.tokens.total for r in load_records(self.userdata) if r.provider == "cursor"), [20, 300, 1000])
+
+    def test_the_earliest_cursor_cache_end_holds_back_freezing(self):
+        cursor = fx.cursor_cache()
+        cursor["accounts"]["other"] = dict(cursor["accounts"]["keychain"], accountKey="o", untilMs=fx.ms(9, 1, 0), records=[])
+        fx.write_userdata(self.userdata, cursor=cursor)
+        self.assertEqual(load_t3(self.userdata)[2], fx.ms(9, 1, 0))
+
+    def test_a_version_1_cursor_cache_is_still_read_when_there_is_no_version_2(self):
+        fx.write_userdata(self.tmp / "userdata1", cursor_version=1)
+        records = load_records(self.tmp / "userdata1")
+        self.assertEqual([r.tokens.total for r in records if r.provider == "cursor"], [3500])
 
     def test_reads_a_version_9_cache_the_way_it_reads_version_5(self):
         v5 = sorted((r.provider, r.model, r.tokens.total) for r in load_records(self.userdata))
@@ -89,11 +103,11 @@ class LoadTests(Case):
         self.assertEqual({r.provider for r in load_records(self.userdata)}, {"codex", "grok", "cursor"})
 
     def test_a_newer_cursor_cache_version_is_refused(self):
-        (self.userdata / "usage-cursor-account-cache-v2.json").write_text("{}")
+        (self.userdata / "usage-cursor-account-cache-v3.json").write_text("{}")
         with self.assertRaises(CacheError) as caught:
             load_records(self.userdata)
-        self.assertIn("T3 Code now writes usage-cursor-account-cache-v2.json", str(caught.exception))
-        (self.userdata / "usage-cursor-account-cache-v2.json").unlink()
+        self.assertIn("T3 Code now writes usage-cursor-account-cache-v3.json", str(caught.exception))
+        (self.userdata / "usage-cursor-account-cache-v3.json").unlink()
         (self.userdata / "usage-scan-cache-v4.json").write_text("{}")  # an older scan cache left behind is fine
         load_records(self.userdata)
 
@@ -172,13 +186,13 @@ class LoadTests(Case):
         self.assertEqual([r for r in load_records(self.userdata) if r.provider == "grok"], [])
 
     def test_missing_cursor_file_means_no_cursor_records(self):
-        (self.userdata / "usage-cursor-account-cache-v1.json").unlink()
+        (self.userdata / "usage-cursor-account-cache-v2.json").unlink()
         self.assertEqual([r for r in load_records(self.userdata) if r.provider == "cursor"], [])
 
     def test_cursor_default_model_is_shown_as_cursor_auto_at_the_same_cost(self):
         strings = ["default", "agent-session"]
         rows = [[fx.ms(10, 18, 3), 0, 1, 1000, 2000, 0, 500, None, "cursor-account:k:1:auto"]]
-        cursor = {"version": 1, "strings": strings, "accounts": {"keychain": {
+        cursor = {"version": 2, "strings": strings, "accounts": {"keychain": {
             "accountKey": "k", "sinceMs": 0, "untilMs": 1, "fetchedAtMs": 1, "records": rows}}}
         table = fx.rates()
         table["document"]["default"] = {"input_cost_per_token": 3e-6, "output_cost_per_token": 1e-5}
@@ -313,7 +327,7 @@ class ClaudeTranscriptTests(Case):
         cursor["accounts"]["keychain"]["untilMs"] = fx.ms(9, 1, 0)  # Cursor's login lapsed on 1 Sep
         fx.write_userdata(self.userdata, cursor=cursor)
         self.assertEqual(cli.gather(self.userdata, self.projects, fx.NOW)[1], fx.ms(9, 1, 0))
-        fx.write_userdata(self.userdata, cursor_enabled=False)  # Cursor off: the scan cache alone decides
+        (self.userdata / "usage-cursor-account-cache-v2.json").unlink()  # no Cursor login: the scan cache alone decides
         self.assertEqual(cli.gather(self.userdata, self.projects, fx.NOW)[1], fx.ms(10, 18, 2))
 
     def test_the_forced_freeze_warning_names_the_newest_day_it_freezes(self):
